@@ -1,0 +1,1394 @@
+#!/usr/bin/env bash
+#
+# install-ai-stack.sh - Install a llama-swap based AI stack by compiling each
+# component from source.
+#
+# Each component's compute backend (CUDA, Vulkan, HIP, Metal, SYCL, CPU) is
+# selected interactively and persisted in /opt/ai/stack.conf so a later run
+# reuses your choices.
+
+set -euo pipefail
+
+PREFIX="/opt/ai"
+BIN_DIR="$PREFIX/bin"
+VERSIONS_FILE="$PREFIX/versions.txt"
+STACK_CONF="$PREFIX/stack.conf"
+
+DATA_DIR="${DATA_DIR:-/var/lib/llama-swap}"
+CONFIG_DIR="$DATA_DIR/config"
+MODEL_DIR="$DATA_DIR/models"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TMPDIR="$(mktemp -d)"
+TEMP_PACKAGES=()
+
+trap 'rm -rf "$TMPDIR"' EXIT
+
+################################################################################
+# Colors + messaging
+################################################################################
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[1;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}==>${NC} $*"; }
+note()  { echo -e "${CYAN}   $*${NC}"; }
+ok()    { echo -e "${GREEN}==>${NC} $*"; }
+warn()  { echo -e "${YELLOW}==>${NC} $*"; }
+die()   { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+
+################################################################################
+# Usage / CLI parsing
+################################################################################
+
+SELECTED_COMPONENTS=()
+USE_ALL_ARG=""
+AUTO_YES=0
+RECONFIGURE=0
+
+usage() {
+    cat <<EOF
+Usage:
+  $(basename "$0") [OPTIONS]
+
+Compile and install the llama-swap AI stack from source. On first run you are
+prompted to choose which components to install and which compute backend each
+uses. Choices are saved to $STACK_CONF and reused on later runs.
+
+Options:
+  --data-dir DIR    Data/config/model directory. Default: $DATA_DIR
+  --backend B       Force every backend to B (cuda, vulkan, hip, metal,
+                    sycl, cpu). Skips interactive backend prompts.
+                    Missing dev toolchains (CUDA toolkit, Vulkan dev tools)
+                    are installed automatically when the backend relies on
+                    them.
+  --component NAME  Add a component to install. May be repeated.
+                    Choices: llama, ik-llama, sd, whisper, kokoro,
+                             crispasr, acestep, audio
+  --kokoro-device D  Kokoro device: gpu, gpu-cu128, cpu, rocm (default auto).
+  --cuda-archs AR   CUDA architectures for CUDA builds (default native).
+  -y, --yes         Skip all prompts, using stored config + defaults.
+  --reconfigure     Re-ask component and backend questions, even if a saved
+                    config exists. Without this flag, an existing
+                    $STACK_CONF is reused as-is.
+  --uninstall       Remove installed AI software.
+  --purge-data      Also delete the data directory (with --uninstall).
+  -h, --help        Show this help and exit.
+
+Examples:
+  $(basename "$0")                     # use saved config, or first-run wizard
+  $(basename "$0") --reconfigure       # change components or backends
+  $(basename "$0") --backend vulkan
+  $(basename "$0") --component llama --component whisper --backend cpu
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --data-dir)
+            [[ $# -lt 2 ]] && die "--data-dir requires a directory"
+            DATA_DIR="$2"; CONFIG_DIR="$DATA_DIR/config"; MODEL_DIR="$DATA_DIR/models"
+            shift 2 ;;
+        --backend)
+            [[ $# -lt 2 ]] && die "--backend requires a value"
+            USE_ALL_ARG="$2"; shift 2 ;;
+        --component)
+            [[ $# -lt 2 ]] && die "--component requires a name"
+            SELECTED_COMPONENTS+=("$2"); shift 2 ;;
+        --kokoro-device)
+            [[ $# -lt 2 ]] && die "--kokoro-device requires a value"
+            KOKORO_DEVICE="$2"; KOKORO_DEVICE_ARG=1; shift 2 ;;
+        --cuda-archs)
+            [[ $# -lt 2 ]] && die "--cuda-archs requires a value"
+            CUDA_ARCHS="$2"; CUDA_ARCHS_ARG=1; shift 2 ;;
+        -y|--yes)
+            AUTO_YES=1; shift ;;
+        --reconfigure)
+            RECONFIGURE=1; shift ;;
+        --uninstall)
+            UNINSTALL=1; shift ;;
+        --purge-data)
+            PURGE_DATA=1; shift ;;
+        -h|--help)
+            usage; exit 0 ;;
+        *)
+            die "Unknown option: $1 (try --help)" ;;
+    esac
+done
+
+################################################################################
+# Component registry
+################################################################################
+#
+# Each component knows:
+#   dir        - source directory (relative to SCRIPT_DIR)
+#   targets    - cmake targets to build
+#   bins       - binaries copied from build/bin/ -> installed under PREFIX/<name>/
+#   links      - (bin -> symlink name) pairs created in BIN_DIR
+#   cmake_args - extra common cmake args
+#   backends   - space-separated list of supported backend keys
+
+# Per-component data lookups. Each cmake component provides:
+#   dir      - source directory (relative to SCRIPT_DIR)
+#   targets  - cmake targets to build
+#   bins     - binaries copied from build/ -> install PREFIX/<dir>/
+#   links    - space-separated "bin link bin link ..." pairs for BIN_DIR
+#   backends - space-separated list of supported backend keys
+component_dir() {
+    case "$1" in
+        llama) echo "llama.cpp";; ik-llama) echo "ik_llama.cpp";;
+        sd) echo "stable-diffusion.cpp";; whisper) echo "whisper.cpp";;
+        acestep) echo "acestep.cpp";; audio) echo "audio.cpp";;
+        crispasr) echo "CrispASR";; kokoro) echo "Kokoro-FastAPI";;
+    esac
+}
+component_targets() {
+    case "$1" in
+        llama) echo "llama-cli llama-server llama-tts llama-bench";;
+        ik-llama) echo "llama-server";;
+        sd) echo "sd-cli sd-server";;
+        whisper) echo "whisper-cli whisper-server";;
+        acestep) echo "ace-server";;
+        audio) echo "audiocpp_cli audiocpp_server";;
+        crispasr) echo "crispasr-cli crispasr-server";;
+    esac
+}
+component_bins() {
+    case "$1" in
+        llama) echo "llama-cli llama-server llama-tts llama-bench";;
+        ik-llama) echo "llama-server";;
+        sd) echo "sd-cli sd-server";;
+        whisper) echo "whisper-cli whisper-server";;
+        acestep) echo "ace-server";;
+        audio) echo "audiocpp_cli audiocpp_server";;
+        crispasr) echo "crispasr crispasr-server";;
+    esac
+}
+component_links() {
+    # output "bin link bin link ..." for BIN_DIR symlinks
+    case "$1" in
+        llama) echo "llama-cli llama-cli llama-server llama-server llama-tts llama-tts llama-bench llama-bench";;
+        ik-llama) echo "llama-server ik-llama-server";;
+        sd) echo "sd-cli sd-cli sd-server sd-server";;
+        whisper) echo "whisper-cli whisper-cli whisper-server whisper-server";;
+        acestep) echo "ace-server ace-server";;
+        audio) echo "audiocpp_cli audiocpp_cli audiocpp_server audiocpp_server";;
+        crispasr) echo "crispasr crispasr crispasr-server crispasr-server";;
+        kokoro) echo "kokoro-fastapi kokoro-fastapi";;
+    esac
+}
+component_backends() {
+    case "$1" in
+        llama) echo "cuda vulkan hip metal sycl cpu";;
+        ik-llama) echo "cuda vulkan cpu";;
+        sd) echo "cuda vulkan hip metal sycl cpu";;
+        whisper) echo "cuda vulkan hip metal sycl cpu";;
+        acestep) echo "cuda vulkan hip metal sycl cpu";;
+        audio) echo "cuda vulkan hip metal cpu";;
+        crispasr) echo "cuda vulkan hip metal sycl cpu";;
+    esac
+}
+
+LLAMA_SWAP_DIR="$SCRIPT_DIR/llama-swap"
+
+# All selectable components
+ALL_COMPONENTS=(llama ik-llama sd whisper kokoro crispasr acestep audio)
+
+# Map component -> human description
+COMPONENT_DESC=(
+    "llama"     "llama.cpp (main LLM engine, llama-server + tools)"
+    "ik-llama"  "ik_llama.cpp (alternative llama-server build)"
+    "sd"        "stable-diffusion.cpp (image generation, sd-server + sd-cli)"
+    "whisper"   "whisper.cpp (speech-to-text, whisper-server + whisper-cli)"
+    "kokoro"    "Kokoro-FastAPI (text-to-speech, Python FastAPI service)"
+    "crispasr"  "CrispASR (speech-to-text, crispasr-server)"
+    "acestep"   "acestep.cpp (audio, ace-server)"
+    "audio"     "audio.cpp (audio, TTS/ASR/audio OpenAI-compatible, audiocpp_server)"
+)
+
+# Backends that are always offered, + hardware-dependent availability
+PRIORITY_BACKENDS="cuda vulkan cpu"
+EXTRA_BACKENDS="hip metal sycl"
+
+################################################################################
+# Backend detection
+################################################################################
+
+uname_s="$(uname -s)"
+
+# --- GPU detection -------------------------------------------------------
+has_lspci_gpu() {
+    command -v lspci >/dev/null 2>&1 || return 1
+    local line
+    line="$(lspci 2>/dev/null | grep -iE 'vga|3d' | grep -i "$1")"
+    [[ -n "$line" ]]
+}
+has_nvidia_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && return 0
+    has_lspci_gpu nvidia
+}
+has_amd_gpu()   { has_lspci_gpu 'amd|radeon'; }
+has_intel_gpu() { has_lspci_gpu 'intel'; }
+
+detect_gpus() {
+    local g=""
+    has_nvidia_gpu && g="$g nvidia"
+    has_amd_gpu    && g="$g amd"
+    has_intel_gpu  && g="$g intel"
+    [[ -n "$g" ]] || g=" (none detected)"
+    echo "$g"
+}
+
+# A backend is "ready" only when its full build toolchain is installed.
+has_cuda()  { command -v nvcc >/dev/null 2>&1 || [[ -x /usr/local/cuda/bin/nvcc ]]; }
+has_vulkan(){ [[ -f /usr/include/vulkan/vulkan.h ]] && command -v glslc >/dev/null 2>&1 && \
+              { ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so' || [[ -e /usr/lib/x86_64-linux-gnu/libvulkan.so ]]; }; }
+has_hip()   { command -v hipcc >/dev/null 2>&1; }
+has_metal() { [[ "$uname_s" == "Darwin" ]]; }
+has_sycl()  { command -v icpx >/dev/null 2>&1 || command -v syclcc >/dev/null 2>&1; }
+
+# Backends whose build toolchain is already installed on this machine.
+detect_backends() {
+    local b="cpu"
+    has_cuda    && b="$b cuda"
+    has_vulkan  && b="$b vulkan"
+    has_hip     && b="$b hip"
+    has_metal   && b="$b metal"
+    has_sycl    && b="$b sycl"
+    echo "$b"
+}
+
+# Should we offer this backend in the menus, even if its toolchain is not yet
+# installed? (Selecting it triggers an on-the-spot toolchain install.)
+backend_offered() {
+    case "$1" in
+        cpu)     return 0 ;;
+        vulkan)  [[ "$uname_s" != "Darwin" ]] ;;
+        cuda)    has_nvidia_gpu || has_cuda ;;
+        hip)     has_amd_gpu || has_hip ;;
+        metal)   [[ "$uname_s" == "Darwin" ]] ;;
+        sycl)    has_sycl || has_intel_gpu ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Short human status for a backend, shown next to it in the menus.
+backend_note() {
+    case "$1" in
+        cpu)    echo "always available" ;;
+        vulkan) if has_vulkan; then echo "ready"; else echo "will install Vulkan dev tools"; fi ;;
+        cuda)   if has_cuda; then echo "ready"; else
+                    local dm
+                    dm=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)
+                    if [[ -n "${dm:-}" ]]; then echo "NVIDIA GPU (driver supports CUDA $dm; will install toolkit)";
+                    else echo "NVIDIA GPU found; will install CUDA toolkit"; fi
+                fi ;;
+        hip)    if has_hip; then echo "ready"; else echo "AMD GPU found; will install HIP/ROCm"; fi ;;
+        metal)  echo "macOS only" ;;
+        sycl)   if has_sycl; then echo "ready"; else echo "Intel GPU found; will install oneAPI"; fi ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Pick the most capable backend given a space-separated list of available ones.
+pick_best() {
+    local avail="$1"
+    for b in cuda vulkan hip metal sycl cpu; do
+        [[ " $avail " == *" $b "* ]] && { echo "$b"; return; }
+    done
+    echo "cpu"
+}
+
+detect_cuda_archs() {
+    if [[ -n "${CUDA_ARCHS:-}" ]]; then
+        echo "$CUDA_ARCHS"
+    elif [[ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]]; then
+        echo "$CMAKE_CUDA_ARCHITECTURES"
+    else
+        echo "native"
+    fi
+}
+
+################################################################################
+# Config load/save
+################################################################################
+
+# default values
+BACKEND_LLAMA=auto
+BACKEND_IK_LLAMA=auto
+BACKEND_SD=auto
+BACKEND_WHISPER=auto
+BACKEND_ACESTEP=auto
+BACKEND_AUDIO=auto
+BACKEND_CRISPASR=auto
+KOKORO_DEVICE="${KOKORO_DEVICE:-auto}"
+CUDA_ARCHS="${CUDA_ARCHS:-native}"
+
+CONFIG_LOADED=0
+
+load_config() {
+    if [[ ! -f "$STACK_CONF" ]]; then return; fi
+    CONFIG_LOADED=1
+    # shellcheck disable=SC1090
+    source "$STACK_CONF"
+}
+
+save_config() {
+    mkdir -p "$PREFIX"
+    cat > "$STACK_CONF" <<EOF
+# Generated by install-ai-stack.sh
+INSTALL_COMPONENTS="${INSTALL_LIST[*]}"
+BACKEND_LLAMA=$BACKEND_LLAMA
+BACKEND_IK_LLAMA=$BACKEND_IK_LLAMA
+BACKEND_SD=$BACKEND_SD
+BACKEND_WHISPER=$BACKEND_WHISPER
+BACKEND_ACESTEP=$BACKEND_ACESTEP
+BACKEND_AUDIO=$BACKEND_AUDIO
+BACKEND_CRISPASR=$BACKEND_CRISPASR
+KOKORO_DEVICE=$KOKORO_DEVICE
+CUDA_ARCHS=$CUDA_ARCHS
+EOF
+}
+
+################################################################################
+# Dependency checks
+################################################################################
+
+ensure_runtime_dependencies() {
+    local missing=()
+    for c in curl jq tar unzip; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return
+    info "Installing runtime dependencies..."
+    apt-get update
+    apt-get install -y "${missing[@]}"
+}
+
+# Node.js is required for the llama-swap web UI. Ubuntu's nodejs is often
+# too old (v18/v20); we guarantee Node 24+ by removing the distro package and
+# installing the official Node via nvm.
+ensure_nodejs() {
+    # If a current, recent node is already on PATH, nothing to do.
+    if command -v node >/dev/null 2>&1; then
+        local cur
+        cur="$(node -v 2>/dev/null)"
+        cur="${cur#v}"
+        local major="${cur%%.*}"
+        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 24 )); then
+            ok "Node.js already at $cur (>= 24 required)"
+            return 0
+        fi
+        warn "Node.js $cur is too old (need >= 24); replacing with official Node 24 via nvm."
+    fi
+
+    # Remove Ubuntu's nodejs/npm if present so the official build wins.
+    if dpkg -s nodejs >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
+        warn "Removing Ubuntu's nodejs/npm (too old / conflicts with official Node)..."
+        apt-get purge -y nodejs npm 2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+    fi
+
+    # Install nvm under the real user's home (the sudo caller, not root).
+    local nvm_home="${HOME}"
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        nvm_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    fi
+    export NVM_DIR="$nvm_home/.nvm"
+    mkdir -p "$NVM_DIR"
+    chown -R "${SUDO_USER:-root}:${SUDO_USER:-root}" "$NVM_DIR" 2>/dev/null || true
+
+    if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
+        info "Installing nvm into $NVM_DIR..."
+        # Run the installer as the real user so it lands in their home and
+        # profile, not root's. nvm's installer honours NVM_DIR for the path.
+        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+            sudo -u "$SUDO_USER" env NVM_DIR="$NVM_DIR" \
+                bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash' || \
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
+        else
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
+        fi
+    fi
+
+    # shellcheck source=/dev/null
+    \. "$NVM_DIR/nvm.sh"
+
+    info "Installing Node.js 24 via nvm..."
+    # nvm is incompatible with a set PREFIX env var, which this script uses
+    # for its own /opt/ai prefix. Unset it for the nvm operations.
+    local _saved_prefix="${PREFIX:-}"
+    unset PREFIX
+    nvm install 24
+    nvm alias default 24
+    PREFIX="${_saved_prefix}"
+
+    # Make node available system-wide so running shells (and services) see it.
+    local node_bin
+    node_bin="$(nvm which 24 2>/dev/null)"
+    node_bin="${node_bin%/*}"
+    if [[ -n "$node_bin" && -d "$node_bin" ]]; then
+        for c in node npm npx; do
+            [[ -e "$node_bin/$c" ]] && ln -sf "$node_bin/$c" "/usr/local/bin/$c"
+        done
+    fi
+
+    if command -v node >/dev/null 2>&1; then
+        ok "Node.js ready: $(node -v) / npm $(npm -v)"
+    else
+        export PATH="$node_bin:$PATH"
+        ok "Node.js ready (via $node_bin): $(node -v) / npm $(npm -v)"
+    fi
+}
+
+ensure_build_dependencies() {
+    TEMP_PACKAGES=()
+    local missing=()
+
+    for p in git cmake build-essential pkg-config; do
+        dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        info "Installing build dependencies: ${missing[*]}"
+        apt-get update
+        apt-get install -y "${missing[@]}"
+        TEMP_PACKAGES=("${missing[@]}")
+    fi
+}
+
+cleanup_build_dependencies() {
+    [[ ${#TEMP_PACKAGES[@]} -eq 0 ]] && return
+    info "Removing temporary build dependencies..."
+    apt-get purge -y "${TEMP_PACKAGES[@]}" || true
+    apt-get autoremove -y || true
+    # Make this idempotent: it may be called explicitly at end of main() and
+    # again by the EXIT trap. Clearing avoids a second "not installed" purge.
+    TEMP_PACKAGES=()
+}
+
+# Install per-backend dev toolchains chosen during backend selection.
+# These are large, so they are *kept* (not uninstalled on exit). Unavailable
+# backends fall back per-component to cpu with a warning.
+ensure_backend_dependencies() {
+    local c varname b seen=() fallback=()
+
+    for c in "${INSTALL_LIST[@]}"; do
+        [[ "$c" == "kokoro" ]] && continue
+        varname="$(backend_varname "$c")"
+        b="${!varname:-auto}"
+        [[ "$b" == "auto" ]] && b="$(pick_best "$(available_backends_for "$c")")"
+        [[ " ${seen[*]} " == *" $b "* ]] || seen+=("$b")
+    done
+
+    for b in "${seen[@]}"; do
+        case "$b" in
+            cuda)
+                if ! has_cuda; then
+                    local driver_cuda_max
+                    driver_cuda_max=$(
+                        nvidia-smi 2>/dev/null |
+                        sed -n 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+                        head -n1
+                    )
+                    local cuda_hint="(driver supports up to CUDA ${driver_cuda_max:-unknown})"
+                    if [[ "$AUTO_YES" != 1 ]] && \
+                       ! confirm "CUDA toolkit is not installed. Install ${cuda_hint}?"; then
+                        fallback+=("$b"); continue
+                    fi
+                    ensure_cuda_toolkit || fallback+=("$b")
+                fi ;;
+            vulkan)
+                has_vulkan || ensure_vulkan_dev || fallback+=("$b") ;;
+            hip)
+                if ! has_hip; then
+                    if [[ "$AUTO_YES" != 1 ]] && \
+                       ! confirm "HIP/ROCm toolchain is not installed. Attempt to install it now?"; then
+                        fallback+=("$b"); continue
+                    fi
+                    ensure_hip_toolchain || fallback+=("$b")
+                fi ;;
+            sycl)
+                if ! has_sycl; then
+                    warn "Intel oneAPI is not auto-installed by this script."
+                    fallback+=("$b")
+                fi ;;
+        esac
+    done
+
+    if [[ ${#fallback[@]} -gt 0 ]]; then
+        echo
+        for c in "${INSTALL_LIST[@]}"; do
+            [[ "$c" == "kokoro" ]] && continue
+            varname="$(backend_varname "$c")"
+            b="${!varname:-auto}"
+            [[ " ${fallback[*]} " == *" $b "* ]] || continue
+            eval "$varname=cpu"
+            warn "$c: backend '$b' unavailable; falling back to cpu"
+        done
+        echo
+    fi
+}
+
+ensure_vulkan_dev() {
+    info "Installing Vulkan development packages..."
+    apt-get install -y libvulkan-dev glslc spirv-headers
+    ldconfig
+    has_vulkan
+}
+
+ensure_cuda_toolkit() {
+    has_cuda && return 0
+
+    # Detect driver's maximum supported CUDA version
+    local driver_cuda_max
+    driver_cuda_max=$(
+        nvidia-smi 2>/dev/null |
+        sed -n 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+        head -n1
+    )
+    [[ -n "$driver_cuda_max" ]] || return 1
+
+    # Discover available versioned cuda-toolkit-X-Y packages <= driver max
+    local available
+    available=$(
+        apt-cache pkgnames 2>/dev/null |
+        grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' |
+        sed 's/^cuda-toolkit-//' |
+        sort -V |
+        while read -r version; do
+            comparable="${version/-/.}"
+            dpkg --compare-versions "$comparable" le "$driver_cuda_max" && echo "$version"
+        done || true
+    )
+    [[ -n "$available" ]] || return 1
+
+    local selected pkg
+    selected=$(echo "$available" | tail -n1)
+    pkg="cuda-toolkit-$selected"
+
+    # Remove Ubuntu's conflicting nvidia-cuda-toolkit if present
+    if dpkg -s nvidia-cuda-toolkit >/dev/null 2>&1; then
+        warn "Removing Ubuntu's nvidia-cuda-toolkit (conflicts with NVIDIA's toolkit)..."
+        apt-get purge -y nvidia-cuda-toolkit nvidia-cuda-dev 2>/dev/null || true
+    fi
+
+    # Add NVIDIA CUDA repository if not present
+    local keyring=/usr/share/keyrings/cuda-archive-keyring.gpg
+    if [[ ! -f "$keyring" ]]; then
+        local repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64"
+        local deb=/tmp/cuda-keyring.deb
+        curl -fsSL "$repo/cuda-keyring_1.1-1_all.deb" -o "$deb" || return 1
+        dpkg -i "$deb" >/dev/null 2>&1 || { rm -f "$deb"; return 1; }
+        rm -f "$deb"
+    fi
+    apt-get update
+
+    info "Installing CUDA $selected (compatible with driver CUDA $driver_cuda_max)..."
+    apt-get install -y --no-install-recommends "$pkg" || return 1
+
+    # Make nvcc visible in the rest of this session
+    export PATH="/usr/local/cuda/bin:$PATH"
+    export CUDA_HOME="/usr/local/cuda"
+
+    [[ -x /usr/local/cuda/bin/nvcc ]]
+}
+
+ensure_hip_toolchain() {
+    info "Installing HIP/ROCm toolchain from Ubuntu repositories..."
+    apt-get install -y --no-install-recommends hipcc || return 1
+    has_hip
+}
+
+################################################################################
+# Prompt helpers
+################################################################################
+
+confirm() {
+    local prompt="$1" default="${2:-n}"
+    if [[ "$AUTO_YES" == 1 ]]; then
+        [[ "$default" == "y" ]] && return 0 || return 1
+    fi
+    local ans
+    read -r -p "$prompt [y/N] " ans
+    [[ "$ans" =~ ^[Yy] ]]
+}
+
+menu_choice() {
+    local prompt="$1"; shift
+    local opts=("$@")
+    while true; do
+        echo "$prompt" >&2
+        for i in "${!opts[@]}"; do
+            echo "  $((i+1)). ${opts[$i]}" >&2
+        done
+        read -r -p "Choice: " ans >&2
+        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#opts[@]} )); then
+            echo "${opts[$((ans-1))]}"
+            return
+        fi
+        warn "Please choose a number between 1 and ${#opts[@]}"
+    done
+}
+
+multi_choice() {
+    local prompt="$1"; shift
+    local opts=("$@")
+    local chosen=()
+    echo "$prompt" >&2
+    for i in "${!opts[@]}"; do
+        echo "  $((i+1)). ${opts[$i]}" >&2
+    done
+    echo "  a. All" >&2
+    echo "  n. None" >&2
+    read -r -p "Select (comma-separated numbers, a for all, n for none): " ans >&2
+    [[ "$ans" == "a" || "$ans" == "A" ]] && { printf '%s\n' "${opts[@]}"; return; }
+    [[ "$ans" == "n" || "$ans" == "N" ]] && return
+    IFS=',' read -r -ra parts <<< "$ans"
+    for p in "${parts[@]}"; do
+        p="$(echo "$p" | tr -d ' ')"
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= ${#opts[@]} )); then
+            chosen+=("${opts[$((p-1))]}")
+        else
+            warn "Ignoring invalid selection: $p"
+        fi
+    done
+    printf '%s\n' "${chosen[@]}"
+}
+
+################################################################################
+# Version helpers (kept for compatibility, minimal use)
+################################################################################
+
+get_installed_version() {
+    grep "^${1}=" "$VERSIONS_FILE" 2>/dev/null | cut -d= -f2 || true
+}
+
+set_installed_version() {
+    local key="$1" value="$2"
+    grep -v "^${key}=" "$VERSIONS_FILE" > "${VERSIONS_FILE}.tmp" || true
+    echo "${key}=${value}" >> "${VERSIONS_FILE}.tmp"
+    mv "${VERSIONS_FILE}.tmp" "$VERSIONS_FILE"
+}
+
+################################################################################
+# Component selection
+################################################################################
+
+install_components() {
+    if [[ ${#SELECTED_COMPONENTS[@]} -gt 0 ]]; then
+        INSTALL_LIST=("${SELECTED_COMPONENTS[@]}")
+        return
+    fi
+    # Non-interactive (-y): reuse saved components when present, else the full stack.
+    if [[ "$AUTO_YES" == 1 ]]; then
+        if [[ "$CONFIG_LOADED" == 1 && -n "${INSTALL_COMPONENTS:-}" ]]; then
+            INSTALL_LIST=($INSTALL_COMPONENTS)
+        else
+            INSTALL_LIST=("${ALL_COMPONENTS[@]}")
+        fi
+        return
+    fi
+    # Reuse the saved config unless the user asked to reconfigure.
+    if [[ "$CONFIG_LOADED" == 1 && -n "${INSTALL_COMPONENTS:-}" && "$RECONFIGURE" == 0 ]]; then
+        INSTALL_LIST=($INSTALL_COMPONENTS)
+        note "Installing saved components: ${INSTALL_LIST[*]} (use --reconfigure to change)"
+        echo
+        return
+    fi
+
+    echo "=== Component selection ==="
+    echo
+    echo "Which components would you like to install?"
+    echo "  (llama-swap itself is always installed)"
+    echo
+    local desc opts
+    desc=()
+    opts=()
+    for c in "${ALL_COMPONENTS[@]}"; do
+        local d=""
+        local i
+        for (( i=0; i<${#COMPONENT_DESC[@]}; i+=2 )); do
+            if [[ "${COMPONENT_DESC[$i]}" == "$c" ]]; then
+                d="${COMPONENT_DESC[$((i+1))]}"
+                break
+            fi
+        done
+        desc+=("$c - $d")
+        opts+=("$c")
+    done
+    local selected
+    mapfile -t selected < <(multi_choice "Select components:" "${desc[@]}")
+    # multi_choice returns the full display label ("llama - <desc>");
+    # reduce each to its leading component key.
+    INSTALL_LIST=()
+    for s in "${selected[@]}"; do
+        INSTALL_LIST+=("${s%% -*}")
+    done
+    [[ ${#INSTALL_LIST[@]} -eq 0 ]] && die "No components selected; nothing to install."
+    echo
+}
+
+################################################################################
+# Backend selection
+################################################################################
+
+backend_varname() {
+    case "$1" in
+        llama)   echo "BACKEND_LLAMA" ;;
+        ik-llama) echo "BACKEND_IK_LLAMA" ;;
+        sd)      echo "BACKEND_SD" ;;
+        whisper) echo "BACKEND_WHISPER" ;;
+        acestep) echo "BACKEND_ACESTEP" ;;
+        audio)   echo "BACKEND_AUDIO" ;;
+        crispasr) echo "BACKEND_CRISPASR" ;;
+        kokoro)  echo "KOKORO_DEVICE" ;;
+    esac
+}
+
+# Intersect a component's supported backends with what we can offer here
+# (installed toolchains AND installable ones, e.g. CUDA on an NVIDIA box).
+available_backends_for() {
+    local c="$1" supported result b
+    supported="$(component_backends "$c")"
+    result=""
+    for b in $supported; do
+        backend_offered "$b" && result="$result $b"
+    done
+    # kokoro is a pip extra, no GGML backend dependency
+    [[ "$c" == "kokoro" ]] && result=" gpu gpu-cu128 cpu rocm"
+    echo "$result"
+}
+
+select_backends() {
+    local components=("$@")
+    local show_all
+
+    # Reuse saved backends unless we were asked to reconfigure interactively.
+    if [[ "$CONFIG_LOADED" == 1 && "$RECONFIGURE" == 0 && "$AUTO_YES" == 0 ]] \
+       && [[ -z "${USE_ALL_ARG:-}" ]]; then
+        note "Reusing saved backend choices from $STACK_CONF (use --reconfigure to change)."
+        echo
+        return
+    fi
+
+    echo "=== Backend selection ==="
+    echo
+    note "Detected GPUs:$(detect_gpus)"
+    note "Build-ready backends: $(detect_backends)"
+    echo
+
+    # Offer "use one backend for all" shortcut for the meaty cmake components.
+    local cmake_components=()
+    for c in "${components[@]}"; do
+        [[ "$c" != "kokoro" ]] && cmake_components+=("$c")
+    done
+
+    show_all="${USE_ALL_ARG:-}"
+
+    if [[ -z "$show_all" && "$AUTO_YES" == 0 && ${#cmake_components[@]} -gt 1 ]]; then
+        if confirm "Use the same backend for all components?"; then
+            local opts b supported
+            opts=()
+            for b in $PRIORITY_BACKENDS $EXTRA_BACKENDS; do
+                backend_offered "$b" || continue
+                supported=1
+                for c in "${cmake_components[@]}"; do
+                    [[ " $(component_backends "$c") " == *" $b "* ]] || supported=0
+                done
+                [[ $supported == 1 ]] || continue
+                opts+=("$b - $(backend_note "$b")")
+            done
+            [[ ${#opts[@]} -eq 0 ]] && opts=("cpu - always available")
+            show_all="$(menu_choice "Choose a backend for all components:" "${opts[@]}")"
+            show_all="${show_all%% - *}"
+            echo
+        fi
+    fi
+
+    local c varname current opts b avail
+    for c in "${components[@]}"; do
+        varname="$(backend_varname "$c")"
+        current="${!varname:-auto}"
+        avail="$(available_backends_for "$c")"
+
+        if [[ -n "$show_all" ]]; then
+            if [[ "$c" == "kokoro" ]]; then
+                current="$(kokoro_device_for_backend "$show_all")"
+            else
+                # only force a backend this component supports, and that we can
+                # offer here (the toolchain gets installed automatically if missing)
+                if [[ " $avail " != *" $show_all "* ]]; then
+                    warn "$c does not support/offer backend '$show_all'; selecting best available."
+                    current="$(pick_best "$avail")"
+                else
+                    current="$show_all"
+                fi
+            fi
+            eval "$varname=$current"
+            ok "$c -> $current"
+            continue
+        fi
+
+        if [[ "$c" == "kokoro" ]]; then
+            # not a GGML cmake backend; device is a pip extra
+            if [[ "$current" != gpu && "$current" != gpu-cu128 && "$current" != cpu && "$current" != rocm ]]; then
+                current="auto"
+            fi
+            if [[ "$AUTO_YES" == 0 ]]; then
+                current="$(menu_choice "Device for kokoro (auto/gpu/gpu-cu128/cpu/rocm): " auto gpu gpu-cu128 cpu rocm)"
+            fi
+        else
+            opts=()
+            for b in $PRIORITY_BACKENDS $EXTRA_BACKENDS; do
+                [[ " $avail " == *" $b "* ]] && opts+=("$b - $(backend_note "$b")")
+            done
+            [[ " $avail " == *" $current "* ]] || current="$(pick_best "$avail")"
+            if [[ "$AUTO_YES" == 0 ]]; then
+                current="$(menu_choice "Backend for $c: " "${opts[@]}")"
+                current="${current%% - *}"
+            fi
+        fi
+        eval "$varname=$current"
+        ok "$c -> $current"
+    done
+}
+
+kokoro_device_for_backend() {
+    case "$1" in
+        cuda) echo "gpu" ;;
+        hip)  echo "rocm" ;;
+        cpu)  echo "cpu" ;;
+        *)    echo "auto" ;;
+    esac
+}
+
+################################################################################
+# Build helpers
+################################################################################
+
+ensure_submodules() {
+    local src="$1"
+    [[ -f "$src/.gitmodules" ]] || return 0
+    [[ -d "$src/.git" ]] || return 0
+    info "Ensuring git submodules in $(basename "$src")..."
+    git -C "$src" submodule update --init --recursive --depth=1 2>/dev/null || \
+        warn "Submodule update skipped/failed for $(basename "$src") (may still build if vendored deps present)."
+}
+
+# cmake args for a given backend. Two forms:
+#   single flag style (GGML_) for llama/ik/whisper/crispasr/acestep
+#   sd style (SD_) for stable-diffusion
+#   engine style (ENGINE_) for audio.cpp
+ggml_backend_flags() {
+    local backend="$1" style="$2"
+    case "$backend" in
+        cpu)    return 0 ;;                      # no flag, ggml CPU is default
+        cuda)   case "$style" in
+                    sd)  echo "-DSD_CUDA=ON -DGGML_CUDA=ON" ;;
+                    audio) echo "-DENGINE_ENABLE_CUDA=ON -DGGML_CUDA=ON" ;;
+                    *)   echo "-DGGML_CUDA=ON" ;;
+                esac ;;
+        vulkan) case "$style" in
+                    sd)  echo "-DSD_VULKAN=ON -DGGML_VULKAN=ON" ;;
+                    audio) echo "-DENGINE_ENABLE_VULKAN=ON -DGGML_VULKAN=ON" ;;
+                    *)   echo "-DGGML_VULKAN=ON" ;;
+                esac ;;
+        hip)    case "$style" in
+                    sd)  echo "-DSD_HIPBLAS=ON -DGGML_HIP=ON" ;;
+                    audio) echo "-DENGINE_ENABLE_HIP=ON -DGGML_HIP=ON" ;;
+                    *)   echo "-DGGML_HIP=ON" ;;
+                esac ;;
+        metal)  case "$style" in
+                    sd)  echo "-DSD_METAL=ON -DGGML_METAL=ON" ;;
+                    audio) echo "-DENGINE_ENABLE_METAL=ON -DGGML_METAL=ON" ;;
+                    *)   echo "-DGGML_METAL=ON" ;;
+                esac ;;
+        sycl)   case "$style" in
+                    sd)  echo "-DSD_SYCL=ON -DGGML_SYCL=ON" ;;
+                    audio) echo "-DGGML_SYCL=ON" ;;   # raw only
+                    *)   echo "-DGGML_SYCL=ON" ;;
+                esac ;;
+        *)      return 0 ;;
+    esac
+}
+
+# Convert cmake type to a string of cmake -D options including cuda archs
+backend_cmake_flags() {
+    local backend="$1" style="$2" flags
+    flags="$(ggml_backend_flags "$backend" "$style")"
+    if [[ "$backend" == "cuda" ]]; then
+        local archs
+        archs="$(detect_cuda_archs)"
+        flags="$flags -DCMAKE_CUDA_ARCHITECTURES=$archs"
+        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+            flags="$flags -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
+        fi
+        flags="$flags -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+    fi
+    echo "$flags"
+}
+
+# CUDA linker flags must be passed as a single argv element (value contains a space).
+cuda_linker_flags() {
+    echo "-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lcuda"
+}
+
+build_and_install() {
+    # $1 = component key
+    local c="$1"
+
+    local varname backend
+    varname="$(backend_varname "$c")"
+    backend="${!varname:-auto}"
+    [[ "$backend" == "auto" ]] && backend="$(pick_best "$(detect_backends)")"
+
+    local dir targets bins links_spec src
+    dir="$(component_dir "$c")"
+    targets="$(component_targets "$c")"
+    bins="$(component_bins "$c")"
+    links_spec="$(component_links "$c")"
+    src="$SCRIPT_DIR/$dir"
+
+    info "Building $c ($dir) with backend: $backend"
+
+    [[ -d "$src" ]] || die "Source directory not found for $c: $src"
+
+    ensure_submodules "$src"
+
+    local build_dir="$src/build"
+    local common_flags=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF)
+
+    # Avoid stale cmake cache from a previous backend run
+    rm -rf "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles" 2>/dev/null || true
+
+    # Mutually exclude other backends to prevent cache contamination
+    [[ "$backend" == "cuda" ]]   && common_flags+=("-DGGML_VULKAN=OFF")
+    [[ "$backend" == "vulkan" ]] && common_flags+=("-DGGML_CUDA=OFF")
+
+    # style / special handling per component
+    local extra=() style flags
+    case "$c" in
+        llama|ik-llama|whisper|acestep|crispasr)
+            style="ggml"
+            [[ "$c" == "whisper" ]] && extra+=(-DWHISPER_FFMPEG=ON)
+            ;;
+        sd)
+            style="sd"
+            extra+=(-DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=ON)
+            ;;
+        audio)
+            style="audio"
+            extra+=(
+                -DAUDIOCPP_DEPLOYMENT_BUILD=ON
+                -DAUDIOCPP_MODEL_SET=full
+                -DENGINE_ENABLE_NATIVE_CPU=OFF
+                -DENGINE_ENABLE_OPENMP=ON
+                -DENGINE_BUILD_EXAMPLES=OFF
+                -DENGINE_BUILD_TESTS=OFF
+                -DENGINE_BUILD_WARMBENCH=OFF
+            )
+            ;;
+        *) die "no build style for $c" ;;
+    esac
+
+    flags="$(backend_cmake_flags "$backend" "$style")"
+
+    local cuda_linker=()
+    if [[ "$backend" == "cuda" ]]; then
+        cuda_linker=("-DCMAKE_EXE_LINKER_FLAGS=$(cuda_linker_flags)")
+    fi
+
+    info "cmake configure..."
+    cmake -S "$src" -B "$build_dir" "${common_flags[@]}" "${extra[@]}" $flags "${cuda_linker[@]}"
+
+    info "Building targets: $targets"
+    cmake --build "$build_dir" --config Release -j"$(nproc)" --target $targets
+
+    # Install binaries
+    local inst="$PREFIX/$dir"
+    rm -rf "$inst"
+    mkdir -p "$inst"
+    local i=0 pairs=()
+    # links_spec is "bin link bin link ..."
+    local blist
+    blist=($bins)
+    IFS=' ' read -r -a lpairs <<< "$links_spec"
+
+    # Copy each built binary
+    for b in $bins; do
+        # find the actual binary. Some projects put outputs in build/bin,
+        # others in build/ (acestep does).
+        local found=""
+        for cand in "$build_dir/bin/$b" "$build_dir/$b"; do
+            if [[ -f "$cand" ]]; then found="$cand"; break; fi
+        done
+        [[ -n "$found" ]] || die "$c: built binary $b not found under $build_dir"
+        cp "$found" "$inst/"
+    done
+
+    # Create symlinks in BIN_DIR per links_spec
+    local k=0
+    while [[ $k -lt ${#lpairs[@]} ]]; do
+        local lbin="${lpairs[$k]}" lname="${lpairs[$((k+1))]}"
+        make_link "$inst/$lbin" "$lname"
+        k=$((k+2))
+    done
+
+    # copy shared libraries if any (whisper/sd/audio vendor ggml .so)
+    copy_shlibs "$build_dir" "$inst"
+
+    record_version "$c" "$src"
+    ok "Installed $c (backend: $backend)"
+}
+
+copy_shlibs() {
+    local build_dir="$1" inst="$2"
+    local shlib_dir=""
+    for d in "$build_dir/bin" "$build_dir"; do
+        if find "$d" -maxdepth 1 -name '*.so*' -print -quit 2>/dev/null | grep -q .; then
+            shlib_dir="$d"; break
+        fi
+    done
+    [[ -z "$shlib_dir" ]] && return
+    # copy only libggml / project-specific libs, keep out tiny support libs
+    find "$shlib_dir" -maxdepth 1 \( -name 'libggml*.so*' -o -name 'libwhisper*.so*' -o -name 'libsd*.so*' -o -name 'libstable*.so*' -o -name 'libengine*.so*' -o -name 'libcrispasr*.so*' -o -name 'libacestep*.so*' \) -exec cp -a {} "$inst/" \; 2>/dev/null || true
+    if find "$inst" -name '*.so*' -print -quit 2>/dev/null | grep -q .; then
+        # register this install dir for the dynamic linker (append, avoid clobber)
+        local conf=/etc/ld.so.conf.d/ai-stack.conf
+        if [[ -w "$(dirname "$conf")" ]]; then
+            grep -qxF "$inst" "$conf" 2>/dev/null || echo "$inst" >> "$conf"
+            ldconfig 2>/dev/null || true
+        fi
+    fi
+}
+
+record_version() {
+    local c="$1" src="$2"
+    local ver
+    ver="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+    set_installed_version "$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')" "$ver"
+}
+
+################################################################################
+# Kokoro-FastAPI (Python)
+################################################################################
+
+install_kokoro() {
+    local src="$SCRIPT_DIR/Kokoro-FastAPI"
+    [[ -d "$src" ]] || die "Kokoro-FastAPI source not found: $src"
+
+    local device="${KOKORO_DEVICE:-auto}"
+    if [[ "$device" == "auto" ]]; then
+        if has_cuda; then device="gpu"; else device="cpu"; fi
+    fi
+    KOKORO_DEVICE="$device"
+
+    info "Installing Kokoro-FastAPI (device: $device)"
+
+    if ! command -v uv >/dev/null 2>&1; then
+        info "Installing uv..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
+        command -v uv >/dev/null 2>&1 || die "uv install failed"
+    fi
+
+    # Required system packages for kokoro (espeak-ng). We install these
+    # persistently since runtime needs them.
+    if ! command -v espeak-ng >/dev/null 2>&1; then
+        info "Installing espeak-ng (runtime requirement)..."
+        apt-get update
+        apt-get install -y espeak-ng
+    fi
+
+    local extra
+    case "$device" in
+        gpu)        extra="gpu" ;;
+        gpu-cu128)  extra="gpu-cu128" ;;
+        rocm)       extra="rocm" ;;
+        cpu|*)      extra="cpu" ;;
+    esac
+
+    ( cd "$src" && uv sync --extra "$extra" --frozen 2>/dev/null || uv sync --extra "$extra" )
+
+    # Create launcher in bin
+    make_kokoro_launcher "$src"
+
+    record_version kokoro "$src"
+    ok "Installed Kokoro-FastAPI (device: $device)"
+}
+
+make_kokoro_launcher() {
+    local src="$1"
+    # launcher that runs uvicorn inside the project venv
+    cat > "$BIN_DIR/kokoro-fastapi" <<EOF
+#!/usr/bin/env bash
+# Launcher for Kokoro-FastAPI
+exec "$src/.venv/bin/uv" run --project "$src" uvicorn api.src.main:app --host \${KOKORO_HOST:-0.0.0.0} --port \${KOKORO_PORT:-8880}
+EOF
+    chmod +x "$BIN_DIR/kokoro-fastapi"
+}
+
+################################################################################
+# llama-swap (Go binary, from release)
+################################################################################
+
+install_llama_swap() {
+    # llama-swap is a Go project. It is downloaded as a prebuilt release (not
+    # compiled from source here - building Go from source is optional if Go is
+    # present). Prefer the prebuilt release for reliability.
+    local json version installed url archive
+    info "Checking llama-swap..."
+
+    json=$(github_release_json mostlygeek/llama-swap 'linux_amd64\.tar\.gz$' 2>/dev/null) || {
+        warn "Could not resolve llama-swap release; trying to build from source."
+        if command -v go >/dev/null 2>&1; then
+            return
+        fi
+        die "No llama-swap release found and Go not installed."
+    }
+
+    version=$(echo "$json" | github_tag)
+    installed=$(get_installed_version LLAMA_SWAP)
+    if [[ "$version" == "$installed" ]]; then
+        ok "llama-swap already current ($version)"
+        install_llama_swap_service
+        return
+    fi
+
+    url=$(echo "$json" | github_asset 'linux_amd64\.tar\.gz$')
+    archive="$TMPDIR/llama-swap.tar.gz"
+    download "$url" "$archive"
+
+    local dest="$PREFIX/llama-swap"
+    rm -rf "$dest"; mkdir -p "$dest"
+    tar -xzf "$archive" -C "$dest"
+    make_link "$dest/llama-swap" llama-swap
+
+    set_installed_version LLAMA_SWAP "$version"
+    install_llama_swap_service
+    ok "Installed llama-swap $version"
+}
+
+build_llama_swap_from_source() {
+    local go_dir="$LLAMA_SWAP_DIR"
+    [[ -d "$go_dir" ]] || die "llama-swap source not found: $go_dir"
+    info "Building llama-swap from source..."
+    ( cd "$go_dir" && CGO_ENABLED=0 go build -trimpath -o "$TMPDIR/llama-swap" . )
+    install -m755 "$TMPDIR/llama-swap" "$BIN_DIR/llama-swap"
+    record_version llama-swap "$go_dir"
+    install_llama_swap_service
+    ok "Built llama-swap from source"
+}
+
+################################################################################
+# GitHub helpers
+################################################################################
+
+github_release_json() {
+    local repo="$1" asset_regex="$2" json release
+    json=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=30" 2>/dev/null) || return 1
+    release=$(echo "$json" | jq -c --arg regex "$asset_regex" '.[] | select(any(.assets[]; .name | test($regex)))' | head -n1)
+    [[ -z "$release" ]] && return 1
+    printf '%s\n' "$release"
+}
+
+github_tag() { jq -r '.tag_name'; }
+
+github_asset() {
+    local regex="$1" url
+    url=$(jq -r --arg regex "$regex" '.assets[] | select(.name | test($regex)) | .browser_download_url' | head -n1)
+    [[ -z "$url" || "$url" == "null" ]] && die "No release asset matched: $regex"
+    printf '%s\n' "$url"
+}
+
+download() {
+    local url="$1" outfile="$2"
+    info "Downloading $(basename "$url")"
+    curl -fL --progress-bar -o "$outfile" "$url"
+}
+
+make_link() {
+    ln -sfn "$1" "$BIN_DIR/$2"
+}
+
+################################################################################
+# systemd service
+################################################################################
+
+install_llama_swap_service() {
+    info "Installing llama-swap systemd service..."
+    mkdir -p "$CONFIG_DIR" "$MODEL_DIR"
+    local SERVICE=/etc/systemd/system/llama-swap.service
+    if [[ ! -f "$SERVICE" ]]; then
+        cat >"$SERVICE" <<EOF
+[Unit]
+Description=llama-swap AI Model Router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+Environment="PATH=/opt/ai/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="LLAMA_CACHE=$MODEL_DIR"
+
+ExecStart=/opt/ai/bin/llama-swap \
+    -config $CONFIG_DIR/config.yaml \
+    -listen 0.0.0.0:9999 \
+    -watch-config
+
+Restart=always
+RestartSec=5
+
+WorkingDirectory=$DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable llama-swap.service 2>/dev/null || true
+        ok "Installed systemd service."
+    else
+        ok "Systemd service already exists."
+    fi
+    if systemctl is-active --quiet llama-swap.service 2>/dev/null; then
+        systemctl restart llama-swap.service 2>/dev/null || true
+    fi
+}
+
+################################################################################
+# Uninstall
+################################################################################
+
+uninstall() {
+    info "Removing installed software..."
+    if systemctl list-unit-files 2>/dev/null | grep -q '^llama-swap.service'; then
+        systemctl stop llama-swap.service 2>/dev/null || true
+        systemctl disable llama-swap.service 2>/dev/null || true
+        rm -f /etc/systemd/system/llama-swap.service
+        systemctl daemon-reload
+    fi
+    rm -f /etc/ld.so.conf.d/ai-stack.conf /etc/ld.so.conf.d/ai-whisper.conf
+    ldconfig 2>/dev/null || true
+    rm -rf "$PREFIX"
+    ok "Removed installed software."
+    if [[ "${PURGE_DATA:-0}" == 1 ]]; then
+        rm -rf "$DATA_DIR"
+        ok "Removed data directory."
+    else
+        echo
+        echo "User data was preserved:"
+        echo "  $DATA_DIR"
+        echo "Delete it manually or rerun with --purge-data."
+    fi
+}
+
+################################################################################
+# Summary
+################################################################################
+
+summary() {
+    echo
+    echo "===================================================="
+    echo "Installation complete"
+    echo
+    echo "Installed to: $PREFIX"
+    echo "llama-swap data: $DATA_DIR"
+    echo "     stack config: $STACK_CONF"
+    echo
+    echo "Versions:"
+    for c in llama ik-llama sd whisper kokoro crispasr acestep audio; do
+        local key ver backend
+        key="$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')"
+        ver="$(get_installed_version "$key")"
+        local varname backendv
+        varname="$(backend_varname "$c")"
+        backendv="${!varname:-auto}"
+        echo "  $c: ${ver:-?} (backend: ${backendv:-auto})"
+    done
+    echo "  llama-swap: $(get_installed_version LLAMA_SWAP)"
+    echo
+    echo "Executables in $BIN_DIR:"
+    for c in llama ik-llama sd whisper acestep audio crispasr; do
+        IFS=' ' read -r -a links <<< "$(component_links "$c")"
+        local k=1
+        while [[ $k -lt ${#links[@]} ]]; do
+            echo "  $BIN_DIR/${links[$k]}"
+            k=$((k+2))
+        done
+    done
+    [[ -f "$BIN_DIR/kokoro-fastapi" ]] && echo "  $BIN_DIR/kokoro-fastapi"
+    [[ -f "$BIN_DIR/llama-swap" ]] && echo "  $BIN_DIR/llama-swap"
+    echo
+    echo "Add this to your ~/.bashrc if needed:"
+    echo "export PATH=$BIN_DIR:\$PATH"
+    echo
+    echo "===================================================="
+}
+
+################################################################################
+# Main
+################################################################################
+
+main() {
+    mkdir -p "$PREFIX" "$BIN_DIR"
+    touch "$VERSIONS_FILE"
+
+    # remember CLI-provided overrides so load_config does not clobber them
+    local cli_kokoro="${KOKORO_DEVICE:-}"
+    local cli_archs="${CUDA_ARCHS:-native}"
+    load_config
+    [[ -n "$cli_kokoro" ]] && KOKORO_DEVICE="$cli_kokoro"
+    [[ -n "${CUDA_ARCHS_ARG:-}" ]] && CUDA_ARCHS="$cli_archs"
+
+    # Ask everything first; only touch apt / install toolchains afterwards,
+    # based on what was actually chosen.
+    install_components
+    select_backends "${INSTALL_LIST[@]}"
+
+    ensure_runtime_dependencies
+    ensure_backend_dependencies
+    ensure_build_dependencies
+    ensure_nodejs
+    trap cleanup_build_dependencies EXIT
+
+    info "Starting builds..."
+    echo
+
+    local built_any=0
+    for c in "${INSTALL_LIST[@]}"; do
+        case "$c" in
+            llama|ik-llama|sd|whisper|acestep|audio|crispasr)
+                build_and_install "$c"; built_any=1 ;;
+            kokoro)
+                install_kokoro; built_any=1 ;;
+            *) warn "Unknown component: $c; skipping" ;;
+        esac
+    done
+
+    # llama-swap is always installed
+    if command -v go >/dev/null 2>&1 && [[ ! -f "$BIN_DIR/llama-swap" ]]; then
+        build_llama_swap_from_source
+    else
+        install_llama_swap
+    fi
+
+    save_config
+
+    cleanup_build_dependencies
+
+    summary
+}
+
+if [[ "${UNINSTALL:-0}" == 1 ]]; then
+    uninstall
+    exit 0
+fi
+
+main
