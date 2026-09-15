@@ -1,0 +1,21 @@
+# Upstream component clones (built as dependencies, not committed)
+acestep.cpp/
+audio.cpp/
+CrispASR/
+ik_llama.cpp/
+Kokoro-FastAPI/
+llama.cpp/
+llama-swap/
+stable-diffusion.cpp/
+whisper.cpp/
+
+# Build artifacts
+*/build/
+build/
+
+# Other install-ai4.sh rewrite kept around
+install-ai4.sh
+
+# editor / OS cruft
+.DS_Store
+*.swp

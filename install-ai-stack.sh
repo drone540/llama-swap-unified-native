@@ -145,7 +145,54 @@ component_dir() {
         sd) echo "stable-diffusion.cpp";; whisper) echo "whisper.cpp";;
         acestep) echo "acestep.cpp";; audio) echo "audio.cpp";;
         crispasr) echo "CrispASR";; kokoro) echo "Kokoro-FastAPI";;
+        llama-swap) echo "llama-swap";;
     esac
+}
+
+repo_url() {
+    case "$1" in
+        llama)     echo "https://github.com/ggml-org/llama.cpp" ;;
+        ik-llama)  echo "https://github.com/ikawrakow/ik_llama.cpp" ;;
+        sd)        echo "https://github.com/leejet/stable-diffusion.cpp" ;;
+        whisper)   echo "https://github.com/ggml-org/whisper.cpp" ;;
+        acestep)   echo "https://github.com/ServeurpersoCom/acestep.cpp" ;;
+        audio)     echo "https://github.com/0xShug0/audio.cpp" ;;
+        crispasr)  echo "https://github.com/CrispStrobe/CrispASR" ;;
+        kokoro)    echo "https://github.com/remsky/Kokoro-FastAPI" ;;
+        llama-swap) echo "https://github.com/mostlygeek/llama-swap" ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_source_repo() {
+    local name="$1" url="$2"
+    local dir="$SCRIPT_DIR/$(component_dir "$name")"
+
+    if [[ -f "$dir/.git/HEAD" ]]; then
+        return 0
+    fi
+    if [[ -e "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+        warn "Source dir $dir exists but is not a git checkout; leaving it as-is"
+        return 1
+    fi
+
+    info "Cloning $name sources from $url..."
+    rm -rf "$dir"
+    git clone "$url" "$dir" || die "Failed to clone $name from $url"
+
+    # Hand ownership back to the real user when run via sudo
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        chown -R "$SUDO_USER:$SUDO_USER" "$dir" 2>/dev/null || true
+    fi
+}
+
+ensure_source_repos() {
+    local name url
+    for name in "${INSTALL_LIST[@]}"; do
+        url="$(repo_url "$name" || true)"
+        [[ -n "$url" ]] || continue
+        ensure_source_repo "$name" "$url"
+    done
 }
 component_targets() {
     case "$1" in
@@ -554,31 +601,13 @@ ensure_cuda_toolkit() {
     )
     [[ -n "$driver_cuda_max" ]] || return 1
 
-    # Discover available versioned cuda-toolkit-X-Y packages <= driver max
-    local available
-    available=$(
-        apt-cache pkgnames 2>/dev/null |
-        grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' |
-        sed 's/^cuda-toolkit-//' |
-        sort -V |
-        while read -r version; do
-            comparable="${version/-/.}"
-            dpkg --compare-versions "$comparable" le "$driver_cuda_max" && echo "$version"
-        done || true
-    )
-    [[ -n "$available" ]] || return 1
-
-    local selected pkg
-    selected=$(echo "$available" | tail -n1)
-    pkg="cuda-toolkit-$selected"
-
     # Remove Ubuntu's conflicting nvidia-cuda-toolkit if present
     if dpkg -s nvidia-cuda-toolkit >/dev/null 2>&1; then
         warn "Removing Ubuntu's nvidia-cuda-toolkit (conflicts with NVIDIA's toolkit)..."
         apt-get purge -y nvidia-cuda-toolkit nvidia-cuda-dev 2>/dev/null || true
     fi
 
-    # Add NVIDIA CUDA repository if not present
+    # Ensure NVIDIA CUDA repo is present so versioned packages are discoverable
     local keyring=/usr/share/keyrings/cuda-archive-keyring.gpg
     if [[ ! -f "$keyring" ]]; then
         local repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64"
@@ -589,10 +618,56 @@ ensure_cuda_toolkit() {
     fi
     apt-get update
 
-    info "Installing CUDA $selected (compatible with driver CUDA $driver_cuda_max)..."
+    # Recommended CUDA toolkit versions (13.1 / 13.2 are known-problematic;
+    # avoid them). 12.8 is the most stable.
+    local good=(12-8 12-9 13-0 13-3)
+    local candidates=() v comparable
+    for v in "${good[@]}"; do
+        comparable="${v/-/.}"
+        dpkg --compare-versions "$comparable" le "$driver_cuda_max" || continue
+        apt-cache show "cuda-toolkit-$v" >/dev/null 2>&1 && candidates+=("$v")
+    done
+
+    # Fallback for older GPUs / narrow repos: pick the highest compatible
+    # while still avoiding the known-bad 13.1/13.2 versions.
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        candidates=($(
+            apt-cache pkgnames 2>/dev/null |
+            grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' |
+            grep -vE '^cuda-toolkit-(13-1|13-2)$' |
+            sed 's/^cuda-toolkit-//' |
+            sort -V |
+            while read -r v; do
+                comparable="${v/-/.}"
+                dpkg --compare-versions "$comparable" le "$driver_cuda_max" && echo "$v"
+            done || true
+        ))
+    fi
+    [[ ${#candidates[@]} -gt 0 ]] || return 1
+
+    local selected
+    if [[ "$AUTO_YES" == 1 || ${#candidates[@]} -eq 1 ]]; then
+        selected="${candidates[0]}"
+        info "Selecting CUDA $selected (most stable option compatible with your driver)."
+    else
+        local opts=() label
+        for v in "${candidates[@]}"; do
+            case "$v" in
+                12-8) label="12.8 - most stable (recommended)" ;;
+                *)    label="${v/-/.}" ;;
+            esac
+            opts+=("$label")
+        done
+        local choice
+        choice="$(menu_choice "Which CUDA toolkit version to install? (driver supports up to CUDA $driver_cuda_max):" "${opts[@]}")"
+        selected="${choice%% *}"
+        selected="${selected//./-}"
+    fi
+
+    local pkg="cuda-toolkit-$selected"
+    info "Installing $pkg (compatible with driver CUDA $driver_cuda_max)..."
     apt-get install -y --no-install-recommends "$pkg" || return 1
 
-    # Make nvcc visible in the rest of this session
     export PATH="/usr/local/cuda/bin:$PATH"
     export CUDA_HOME="/usr/local/cuda"
 
@@ -1176,6 +1251,7 @@ install_llama_swap() {
 }
 
 build_llama_swap_from_source() {
+    ensure_source_repo llama-swap "$(repo_url llama-swap)" || true
     local go_dir="$LLAMA_SWAP_DIR"
     [[ -d "$go_dir" ]] || die "llama-swap source not found: $go_dir"
     info "Building llama-swap from source..."
@@ -1352,6 +1428,7 @@ main() {
     install_components
     select_backends "${INSTALL_LIST[@]}"
 
+    ensure_source_repos
     ensure_runtime_dependencies
     ensure_backend_dependencies
     ensure_build_dependencies
