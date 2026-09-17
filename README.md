@@ -124,9 +124,17 @@ can't be provisioned, that component falls back to CPU with a warning.
 - **Node.js 24** (for the web UI) → installed via nvm into your home, with
   `node`/`npm`/`npx` symlinked into `/usr/local/bin`.
 
-During a real build, if your total RAM+swap is below 16 GiB the installer warns
-and offers to create a swapfile (via `fallocate`, persisted in `/etc/fstab`)
-before starting the compile.
+During a real run, if your total RAM+swap is below 16 GiB the installer warns.
+Extra swap is only offered when the heavy `audio.cpp` build is selected. If you
+accept, it handles whatever swap you already have:
+
+- `/swapfile` already large enough → nothing to do,
+- active `/swapfile` too small → offer to **resize it** or add a **temporary
+  swapfile** that is removed when the run finishes,
+- no `/swapfile` → create one (`fallocate`, persisted in `/etc/fstab`).
+
+`--no-swap` never creates or prompts about swap; `-y` always continues without
+extra swap.
 
 Add the bin dir to your shell if it isn't already on `PATH`:
 

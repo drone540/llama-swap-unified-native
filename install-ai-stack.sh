@@ -33,8 +33,21 @@ LLAMA_SWAP_DIR="$SOURCE_DIR/llama-swap"
 
 TMPDIR="$(mktemp -d)"
 TEMP_PACKAGES=()
+TEMP_SWAPFILE=""
 
-trap 'rm -rf "$TMPDIR"' EXIT
+# Single EXIT hook. Functions used for cleanup may not be defined yet when the
+# script bails during early arg parsing, hence the declare -F guards.
+on_exit() {
+    rm -rf "$TMPDIR"
+    if declare -F cleanup_temporary_swap >/dev/null; then
+        cleanup_temporary_swap
+    fi
+    if declare -F cleanup_build_dependencies >/dev/null; then
+        cleanup_build_dependencies
+    fi
+}
+
+trap on_exit EXIT
 
 ################################################################################
 # Colors + messaging
@@ -1484,13 +1497,16 @@ system_memory() {
 }
 
 check_memory() {
-    local ram_kb swap_kb combined_gb
+    local ram_kb swap_kb combined_gb _have_audio=0 c
     read -r ram_kb swap_kb <<< "$(system_memory)"
     combined_gb=$(( (ram_kb + swap_kb) / 1024 / 1024 ))
     if (( combined_gb >= 16 )); then
         ok "Memory check passed: ${combined_gb} GiB RAM+swap detected."
         return
     fi
+    for c in "${INSTALL_LIST[@]:-}"; do
+        [[ "$c" == "audio" ]] && { _have_audio=1; break; }
+    done
     echo
     note "Low memory detected:"
     note "  RAM:      $(( ram_kb / 1024 / 1024 )) GiB"
@@ -1498,13 +1514,18 @@ check_memory() {
     note "  Combined: ${combined_gb} GiB"
     note "16 GiB combined RAM+swap is recommended."
     echo
+    # Extra swap is really only worth it for the heavy audio.cpp build.
+    if (( _have_audio != 1 )); then
+        warn "Continuing with ${combined_gb} GiB RAM+swap (audio.cpp not selected; other builds fit)."
+        return
+    fi
     if [[ "$AUTO_YES" == 1 || "$NO_SWAP" == 1 ]]; then
-        warn "Continuing with ${combined_gb} GiB RAM+swap (builds may be slow or fail)."
+        warn "Continuing with ${combined_gb} GiB RAM+swap (the audio.cpp build may be slow or fail)."
         return
     fi
     local choice
-    choice="$(menu_choice "What would you like to do?" \
-        "Continue (16 GiB RAM+swap recommended)" \
+    choice="$(menu_choice "audio.cpp is a heavy build. What would you like to do?" \
+        "Continue (audio.cpp build may be slow or fail)" \
         "Create swapfile (${SWAP_SIZE})" \
         "Abort")"
     case "$choice" in
@@ -1513,6 +1534,22 @@ check_memory() {
         Abort*)    die "Aborting." ;;
         *)         die "Unknown choice." ;;
     esac
+}
+
+# Converts sizes like "8G" / "512M" / "1024K" to kibibytes; bare numbers = GiB.
+size_to_kb() {
+    local size="$1"
+    case "$size" in
+        *G) echo $(( ${size%G} * 1024 * 1024 )) ;;
+        *M) echo $(( ${size%M} * 1024 )) ;;
+        *K) echo ${size%K} ;;
+        *)  echo $(( size * 1024 * 1024 )) ;;
+    esac
+}
+
+# Size of an existing swapfile in kibibytes (from the file itself).
+swap_file_kb() {
+    stat -c%s "$1" 2>/dev/null | awk '{print int($1/1024)}'
 }
 
 swap_dd() {
@@ -1525,47 +1562,117 @@ swap_dd() {
     as_root dd if=/dev/zero of="$file" bs=1M count="$blocks" status=progress
 }
 
+# Carve out the swapfile with fallocate (dd as fallback).
+allocate_swapfile() {
+    local file="$1" size="$2"
+    if command -v fallocate >/dev/null 2>&1 && as_root fallocate -l "$size" "$file"; then
+        return
+    fi
+    warn "fallocate failed; using dd."
+    swap_dd "$size" "$file"
+}
+
+# Initialize and enable an (already carved-out) swapfile. persistent=1 adds an
+# /etc/fstab entry so it survives reboots.
+activate_swapfile() {
+    local file="$1" persistent="$2"
+    as_root chmod 600 "$file"
+    as_root mkswap "$file"
+    as_root swapon "$file"
+    if [[ "$persistent" == "1" ]] && ! grep -qF "$file" /etc/fstab 2>/dev/null; then
+        info "Persisting swap entry in /etc/fstab..."
+        echo "$file none swap sw 0 0" | as_root tee -a /etc/fstab >/dev/null
+    fi
+}
+
+# Resize an existing active swapfile: swapoff, recreate, re-enable (persistent).
+resize_swapfile() {
+    local file="$1" size="$2"
+    note "Temporarily disabling $file (swapoff)..."
+    if ! as_root swapoff "$file"; then
+        warn "swapoff $file failed; cannot resize in place. Falling back to a temporary swapfile."
+        create_temporary_swapfile "$size"
+        return 1
+    fi
+    as_root rm -f "$file"
+    allocate_swapfile "$file" "$size"
+    activate_swapfile "$file" 1
+    ok "Resized $file to $size and re-enabled it."
+}
+
+# Add a swapfile that exists only for this run and is removed afterwards;
+# it is never persisted to /etc/fstab.
+create_temporary_swapfile() {
+    local size="$1"
+    local file=/swapfile.ai-stack-tmp
+    if swapon --show --noheadings 2>/dev/null | grep -qF "$file"; then
+        note "Temporary swapfile $file is already active."
+    else
+        info "Creating temporary swapfile $file of size $size (removed after this run)..."
+        allocate_swapfile "$file" "$size"
+        activate_swapfile "$file" 0
+    fi
+    TEMP_SWAPFILE="$file"
+    ok "Temporary swapfile $file is active (${size})."
+}
+
+# Remove and delete the temporary swapfile, if one was created this run.
+cleanup_temporary_swap() {
+    [[ -n "${TEMP_SWAPFILE:-}" ]] || return
+    if swapon --show --noheadings 2>/dev/null | grep -qF "$TEMP_SWAPFILE"; then
+        note "Removing temporary swapfile $TEMP_SWAPFILE..."
+        as_root swapoff "$TEMP_SWAPFILE" 2>/dev/null || true
+    fi
+    as_root rm -f "$TEMP_SWAPFILE" 2>/dev/null || true
+    TEMP_SWAPFILE=""
+}
+
 create_swapfile() {
     local size="$SWAP_SIZE"
     local swapfile=/swapfile
+    local want_kb current_kb
+
+    want_kb="$(size_to_kb "$size")"
+
+    # Existing *active* swapfile at the default location
     if [[ -f "$swapfile" ]] && swapon --show --noheadings 2>/dev/null | grep -qF "$swapfile"; then
-        note "Swapfile $swapfile is already active."
+        current_kb="$(swap_file_kb "$swapfile")"
+        if (( current_kb >= want_kb )); then
+            ok "Existing $swapfile is already $(( current_kb / 1024 / 1024 )) GiB (>= $size); no change needed."
+            return
+        fi
+        echo
+        note "Your existing $swapfile is $(( current_kb / 1024 / 1024 )) GiB (recommended: $size)."
+        local choice
+        choice="$(menu_choice "How should I handle swap?" \
+            "Resize $swapfile to ${size} (temporarily disables swap)" \
+            "Add a separate temporary swapfile (${size}, removed after this run)" \
+            "Skip (continue without extra swap)")"
+        case "$choice" in
+            Resize*) resize_swapfile "$swapfile" "$size" ;;
+            Add*)    create_temporary_swapfile "$size" ;;
+            Skip*)   warn "Continuing without extra swap." ;;
+            *)       warn "Unknown choice; continuing without extra swap." ;;
+        esac
         return
     fi
+
+    # No active root swapfile: create (or reuse + resize) a persistent one.
     if [[ ! -f "$swapfile" ]]; then
         info "Creating swapfile $swapfile of size $size..."
-        if command -v fallocate >/dev/null 2>&1; then
-            as_root fallocate -l "$size" "$swapfile" || {
-                warn "fallocate failed; using dd."
-                swap_dd "$size" "$swapfile"
-            }
-        else
-            swap_dd "$size" "$swapfile"
-        fi
+    else
+        note "Reusing existing inactive $swapfile (resizing to $size)..."
     fi
-    as_root chmod 600 "$swapfile"
-    as_root mkswap "$swapfile"
-    as_root swapon "$swapfile"
-    if ! grep -qF "$swapfile" /etc/fstab 2>/dev/null; then
-        info "Persisting swap entry in /etc/fstab..."
-        echo "$swapfile none swap sw 0 0" | as_root tee -a /etc/fstab >/dev/null
-    fi
+    allocate_swapfile "$swapfile" "$size"
+    activate_swapfile "$swapfile" 1
     ok "Swapfile $swapfile is active (${size})."
 }
 
-################################################################################
 # Main
 ################################################################################
 
 main() {
     require_sudo
-
-    # Preflight: check combined RAM+swap before compiling, and compute the
-    # parallel build job count (RAM-scaled, capped at nproc).
-    check_memory
-    BUILD_JOBS="$(build_jobs)"
-    note "Build jobs: $BUILD_JOBS (RAM-scaled, capped at nproc)"
-    echo
 
     as_root mkdir -p "$PREFIX" "$BIN_DIR"
     as_root touch "$VERSIONS_FILE"
@@ -1583,12 +1690,19 @@ main() {
     install_components
     select_backends "${INSTALL_LIST[@]}"
 
+    # Preflight now that components are known: warn on low RAM+swap, and only
+    # offer extra swap when the heavy audio.cpp build is selected. Also pick
+    # the parallel build job count (RAM-scaled, capped at nproc).
+    check_memory
+    BUILD_JOBS="$(build_jobs)"
+    note "Build jobs: $BUILD_JOBS (RAM-scaled, capped at nproc)"
+    echo
+
     ensure_source_repos
     ensure_runtime_dependencies
     ensure_backend_dependencies
     ensure_build_dependencies
     ensure_nodejs
-    trap cleanup_build_dependencies EXIT
 
     info "Starting builds..."
     echo
@@ -1614,6 +1728,7 @@ main() {
     save_config
 
     cleanup_build_dependencies
+    cleanup_temporary_swap
 
     summary
 }
