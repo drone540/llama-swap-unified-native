@@ -1178,10 +1178,15 @@ copy_shlibs() {
     fi
 }
 
+# Record the release this checkout is based on: exactly-on-tag, falling back to
+# the nearest reachable tag, then the short commit hash. Release-based values
+# change only when upstream ships a new tagged release, unlike a raw HEAD hash.
 record_version() {
     local c="$1" src="$2"
-    local ver
-    ver="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+    local ver=""
+    ver="$(git -C "$src" describe --tags --exact-match 2>/dev/null || true)"
+    [[ -z "$ver" ]] && ver="$(git -C "$src" describe --tags --abbrev=0 2>/dev/null || true)"
+    [[ -z "$ver" ]] && ver="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     set_installed_version "$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')" "$ver"
 }
 
@@ -1208,15 +1213,24 @@ install_kokoro() {
         command -v uv >/dev/null 2>&1 || die "uv install failed"
     fi
 
-    # Required system packages for kokoro (espeak-ng runtime; python3-dev and
-    # python3-venv so uv can build Python deps with C extensions). Installed
-    # persistently since runtime needs them.
-    if ! command -v espeak-ng >/dev/null 2>&1 \
-       || ! dpkg-query -W -f='${Status}' python3-dev 2>/dev/null | grep -q "ok installed" \
-       || ! dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "ok installed"; then
-        info "Installing kokoro build/runtime packages (espeak-ng, python3-dev, python3-venv)..."
+    # Required system packages for kokoro. espeak-ng is needed at runtime and is
+    # installed persistently; python3-dev/python3-venv are build-only deps and
+    # are tracked in TEMP_PACKAGES so cleanup_build_dependencies purges them.
+    if ! command -v espeak-ng >/dev/null 2>&1; then
+        info "Installing espeak-ng (runtime requirement)..."
         as_root apt-get update
-        as_root apt-get install -y espeak-ng python3-dev python3-venv
+        as_root apt-get install -y espeak-ng
+    fi
+
+    local kokoro_build_pkgs=()
+    for p in python3-dev python3-venv; do
+        dpkg -s "$p" >/dev/null 2>&1 || kokoro_build_pkgs+=("$p")
+    done
+    if [[ ${#kokoro_build_pkgs[@]} -gt 0 ]]; then
+        info "Installing kokoro build-only dependencies: ${kokoro_build_pkgs[*]}"
+        as_root apt-get update
+        as_root apt-get install -y "${kokoro_build_pkgs[@]}"
+        TEMP_PACKAGES+=("${kokoro_build_pkgs[@]}")
     fi
 
     local extra
@@ -1229,6 +1243,19 @@ install_kokoro() {
 
     ( cd "$src" && uv sync --extra "$extra" --frozen 2>/dev/null || uv sync --extra "$extra" )
 
+    [[ -x "$src/.venv/bin/python" ]] || die "Kokoro venv python not found after uv sync"
+
+    # Fetch the model/tuner weights if not already present (idempotent).
+    if ! "$src/.venv/bin/python" "$src/docker/scripts/download_model.py" --output "$src/api/src/models/v1_0"; then
+        die "Failed to download Kokoro model weights"
+    fi
+
+    # Japanese TTS needs the UniDic dictionary (~526MB) for fugashi/MeCab.
+    if confirm "Download the Japanese dictionary (UniDic, ~526MB) for Japanese TTS support?" y; then
+        info "Downloading UniDic dictionary for Japanese support..."
+        "$src/.venv/bin/python" -m unidic download || warn "UniDic download failed; Japanese TTS will be unavailable."
+    fi
+
     # Create launcher in bin
     make_kokoro_launcher "$src"
 
@@ -1238,11 +1265,33 @@ install_kokoro() {
 
 make_kokoro_launcher() {
     local src="$1"
-    # launcher that runs uvicorn inside the project venv
+    local device="${KOKORO_DEVICE:-auto}"
+    local espeak_data use_gpu dev
+    espeak_data=""
+    for d in /usr/share/espeak-ng-data /usr/lib/*/espeak-ng-data; do
+        [[ -d "$d" ]] && { espeak_data="$d"; break; }
+    done
+    case "$device" in
+        gpu|gpu-cu128)  use_gpu=true  dev=gpu ;;
+        rocm)           use_gpu=true  dev=rocm ;;
+        *)              use_gpu=false dev=cpu ;;
+    esac
+    # Launcher runs uvicorn from the project venv (matching docker/scripts/
+    # entrypoint.sh) rather than `uv run`, so it needs no uv on PATH.
     as_root tee "$BIN_DIR/kokoro-fastapi" >/dev/null <<EOF
 #!/usr/bin/env bash
 # Launcher for Kokoro-FastAPI
-exec "$src/.venv/bin/uv" run --project "$src" uvicorn api.src.main:app --host \${KOKORO_HOST:-0.0.0.0} --port \${KOKORO_PORT:-8880}
+SRC="$src"
+export PYTHONPATH="\$SRC:\$SRC/api"
+export USE_GPU="$use_gpu"
+export DEVICE="$dev"
+export MODEL_DIR=src/models
+export VOICES_DIR=src/voices/v1_0
+export WEB_PLAYER_PATH="\$SRC/web"
+export PHONEMIZER_ESPEAK_PATH=/usr/bin
+export PHONEMIZER_ESPEAK_DATA="$espeak_data"
+export ESPEAK_DATA_PATH="$espeak_data"
+exec "\$SRC/.venv/bin/python" -m uvicorn api.src.main:app --host "\${KOKORO_HOST:-0.0.0.0}" --port "\${KOKORO_PORT:-8880}"
 EOF
     as_root chmod +x "$BIN_DIR/kokoro-fastapi"
 }
@@ -1692,6 +1741,10 @@ main() {
     # based on what was actually chosen.
     install_components
     select_backends "${INSTALL_LIST[@]}"
+
+    # Persist choices now so a failed build doesn't discard them; main()
+    # re-saves after builds pick up any resolved KOKORO_DEVICE.
+    save_config
 
     # Preflight now that components are known: warn on low RAM+swap, and only
     # offer extra swap when the heavy audio.cpp build is selected. Also pick

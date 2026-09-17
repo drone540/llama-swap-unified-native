@@ -155,6 +155,17 @@ echo 'export PATH=/opt/ai-stack/bin:$PATH' >> ~/.bashrc
   revision is currently checked out in its cloned directory, so results can
   change as upstream advances. For a fully reproducible build, check out a known
   commit in each upstream repo before running the installer.
+- **Installed versions are tracked by release** (`/opt/ai-stack/versions.txt`):
+  the git tag at or near the checked-out revision (e.g. `b10733`, `v1.9.3`,
+  `v0.8.31`), falling back to the commit hash when a repo has no tags. These
+  change only when upstream cuts a new release.
+- **Kokoro** creates its venv with uv, downloads the model weights, and (on
+  confirmation, default yes) the ~526MB UniDic dictionary for **Japanese TTS**.
+  The `kokoro-fastapi` launcher runs uvicorn from the project's `.venv` (no `uv`
+  needed at runtime), and the build-only packages (`python3-dev`, `python3-venv`)
+  are purged after the install finishes.
+- **Selections are saved before building**, so a failed build doesn't discard
+  your component/backend choices; the next run resumes from them.
 - Components are compiled locally, so builds take time; only the components you
   select are built. Parallelism is RAM-scaled by default (`--jobs N` to override,
   capped at your CPU count).
