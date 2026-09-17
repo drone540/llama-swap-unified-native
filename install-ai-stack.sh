@@ -1208,12 +1208,15 @@ install_kokoro() {
         command -v uv >/dev/null 2>&1 || die "uv install failed"
     fi
 
-    # Required system packages for kokoro (espeak-ng). We install these
+    # Required system packages for kokoro (espeak-ng runtime; python3-dev and
+    # python3-venv so uv can build Python deps with C extensions). Installed
     # persistently since runtime needs them.
-    if ! command -v espeak-ng >/dev/null 2>&1; then
-        info "Installing espeak-ng (runtime requirement)..."
+    if ! command -v espeak-ng >/dev/null 2>&1 \
+       || ! dpkg-query -W -f='${Status}' python3-dev 2>/dev/null | grep -q "ok installed" \
+       || ! dpkg-query -W -f='${Status}' python3-venv 2>/dev/null | grep -q "ok installed"; then
+        info "Installing kokoro build/runtime packages (espeak-ng, python3-dev, python3-venv)..."
         as_root apt-get update
-        as_root apt-get install -y espeak-ng
+        as_root apt-get install -y espeak-ng python3-dev python3-venv
     fi
 
     local extra
