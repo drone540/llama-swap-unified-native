@@ -4,21 +4,32 @@
 # component from source.
 #
 # Each component's compute backend (CUDA, Vulkan, HIP, Metal, SYCL, CPU) is
-# selected interactively and persisted in /opt/ai/stack.conf so a later run
-# reuses your choices.
+# selected interactively and persisted in /opt/ai-stack/stack.conf so a later
+# run reuses your choices.
+#
+# This installer must be run as a NORMAL (non-root) user. Everything it needs
+# root for (system packages, /opt/ai-stack, systemd, swap) is run through sudo.
 
 set -euo pipefail
 
-PREFIX="/opt/ai"
+PREFIX="/opt/ai-stack"
 BIN_DIR="$PREFIX/bin"
 VERSIONS_FILE="$PREFIX/versions.txt"
 STACK_CONF="$PREFIX/stack.conf"
+
+# User-owned source and build trees; these never require root.
+SOURCE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ai-stack/src"
+BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ai-stack/build"
 
 DATA_DIR="${DATA_DIR:-/var/lib/llama-swap}"
 CONFIG_DIR="$DATA_DIR/config"
 MODEL_DIR="$DATA_DIR/models"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SWAP_SIZE="${SWAP_SIZE:-8G}"
+NO_SWAP="${NO_SWAP:-0}"
+BUILD_JOBS_ARG=""
+
+LLAMA_SWAP_DIR="$SOURCE_DIR/llama-swap"
 
 TMPDIR="$(mktemp -d)"
 TEMP_PACKAGES=()
@@ -41,6 +52,19 @@ note()  { echo -e "${CYAN}   $*${NC}"; }
 ok()    { echo -e "${GREEN}==>${NC} $*"; }
 warn()  { echo -e "${YELLOW}==>${NC} $*"; }
 die()   { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+
+# Never run the installer itself as root. Privileged actions go through sudo.
+if [[ $EUID -eq 0 ]]; then
+    die "Do not run this installer with sudo. Run it as a normal user."
+fi
+
+as_root() {
+    sudo "$@"
+}
+
+require_sudo() {
+    sudo -v
+}
 
 ################################################################################
 # Usage / CLI parsing
@@ -72,6 +96,10 @@ Options:
                              crispasr, acestep, audio
   --kokoro-device D  Kokoro device: gpu, gpu-cu128, cpu, rocm (default auto).
   --cuda-archs AR   CUDA architectures for CUDA builds (default native).
+  --jobs N          Number of parallel build jobs (default: auto by RAM, cap nproc).
+  --swap-size SIZE  Swap file size offered by the low-memory prompt (default
+                    ${SWAP_SIZE}, e.g. 8G).
+  --no-swap          Never create or prompt about swap files.
   -y, --yes         Skip all prompts, using stored config + defaults.
   --reconfigure     Re-ask component and backend questions, even if a saved
                     config exists. Without this flag, an existing
@@ -106,6 +134,14 @@ while [[ $# -gt 0 ]]; do
         --cuda-archs)
             [[ $# -lt 2 ]] && die "--cuda-archs requires a value"
             CUDA_ARCHS="$2"; CUDA_ARCHS_ARG=1; shift 2 ;;
+        --jobs)
+            [[ $# -lt 2 ]] && die "--jobs requires a number"
+            BUILD_JOBS_ARG="$2"; shift 2 ;;
+        --swap-size)
+            [[ $# -lt 2 ]] && die "--swap-size requires a size"
+            SWAP_SIZE="$2"; shift 2 ;;
+        --no-swap)
+            NO_SWAP=1; shift ;;
         -y|--yes)
             AUTO_YES=1; shift ;;
         --reconfigure)
@@ -126,7 +162,7 @@ done
 ################################################################################
 #
 # Each component knows:
-#   dir        - source directory (relative to SCRIPT_DIR)
+#   dir        - source directory (relative to SOURCE_DIR)
 #   targets    - cmake targets to build
 #   bins       - binaries copied from build/bin/ -> installed under PREFIX/<name>/
 #   links      - (bin -> symlink name) pairs created in BIN_DIR
@@ -134,7 +170,7 @@ done
 #   backends   - space-separated list of supported backend keys
 
 # Per-component data lookups. Each cmake component provides:
-#   dir      - source directory (relative to SCRIPT_DIR)
+#   dir      - source directory (relative to SOURCE_DIR)
 #   targets  - cmake targets to build
 #   bins     - binaries copied from build/ -> install PREFIX/<dir>/
 #   links    - space-separated "bin link bin link ..." pairs for BIN_DIR
@@ -166,7 +202,8 @@ repo_url() {
 
 ensure_source_repo() {
     local name="$1" url="$2"
-    local dir="$SCRIPT_DIR/$(component_dir "$name")"
+    local dir="$SOURCE_DIR/$(component_dir "$name")"
+    mkdir -p "$SOURCE_DIR"
 
     if [[ -f "$dir/.git/HEAD" ]]; then
         return 0
@@ -179,11 +216,6 @@ ensure_source_repo() {
     info "Cloning $name sources from $url..."
     rm -rf "$dir"
     git clone "$url" "$dir" || die "Failed to clone $name from $url"
-
-    # Hand ownership back to the real user when run via sudo
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        chown -R "$SUDO_USER:$SUDO_USER" "$dir" 2>/dev/null || true
-    fi
 }
 
 ensure_source_repos() {
@@ -240,8 +272,6 @@ component_backends() {
         crispasr) echo "cuda vulkan hip metal sycl cpu";;
     esac
 }
-
-LLAMA_SWAP_DIR="$SCRIPT_DIR/llama-swap"
 
 # All selectable components
 ALL_COMPONENTS=(llama ik-llama sd whisper kokoro crispasr acestep audio)
@@ -381,13 +411,17 @@ CONFIG_LOADED=0
 load_config() {
     if [[ ! -f "$STACK_CONF" ]]; then return; fi
     CONFIG_LOADED=1
+    # TODO: parse $STACK_CONF with a proper key=value parser instead of
+    # sourcing it (values are currently trusted shell assignments).
     # shellcheck disable=SC1090
     source "$STACK_CONF"
 }
 
 save_config() {
-    mkdir -p "$PREFIX"
-    cat > "$STACK_CONF" <<EOF
+    as_root mkdir -p "$PREFIX"
+    # TODO: replace sourcing-based config with a proper key=value parser
+    # shellcheck disable=SC2028
+    as_root tee "$STACK_CONF" >/dev/null <<EOF
 # Generated by install-ai-stack.sh
 INSTALL_COMPONENTS="${INSTALL_LIST[*]}"
 BACKEND_LLAMA=$BACKEND_LLAMA
@@ -413,8 +447,8 @@ ensure_runtime_dependencies() {
     done
     [[ ${#missing[@]} -eq 0 ]] && return
     info "Installing runtime dependencies..."
-    apt-get update
-    apt-get install -y "${missing[@]}"
+    as_root apt-get update
+    as_root apt-get install -y "${missing[@]}"
 }
 
 # Node.js is required for the llama-swap web UI. Ubuntu's nodejs is often
@@ -437,30 +471,17 @@ ensure_nodejs() {
     # Remove Ubuntu's nodejs/npm if present so the official build wins.
     if dpkg -s nodejs >/dev/null 2>&1 || command -v npm >/dev/null 2>&1; then
         warn "Removing Ubuntu's nodejs/npm (too old / conflicts with official Node)..."
-        apt-get purge -y nodejs npm 2>/dev/null || true
-        apt-get autoremove -y 2>/dev/null || true
+        as_root apt-get purge -y nodejs npm 2>/dev/null || true
+        as_root apt-get autoremove -y 2>/dev/null || true
     fi
 
-    # Install nvm under the real user's home (the sudo caller, not root).
-    local nvm_home="${HOME}"
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-        nvm_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    fi
-    export NVM_DIR="$nvm_home/.nvm"
+    # Install nvm under the real user's home (this script runs as the user).
+    export NVM_DIR="$HOME/.nvm"
     mkdir -p "$NVM_DIR"
-    chown -R "${SUDO_USER:-root}:${SUDO_USER:-root}" "$NVM_DIR" 2>/dev/null || true
 
     if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
         info "Installing nvm into $NVM_DIR..."
-        # Run the installer as the real user so it lands in their home and
-        # profile, not root's. nvm's installer honours NVM_DIR for the path.
-        if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-            sudo -u "$SUDO_USER" env NVM_DIR="$NVM_DIR" \
-                bash -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash' || \
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
-        else
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
-        fi
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.7/install.sh | bash
     fi
 
     # shellcheck source=/dev/null
@@ -468,7 +489,7 @@ ensure_nodejs() {
 
     info "Installing Node.js 24 via nvm..."
     # nvm is incompatible with a set PREFIX env var, which this script uses
-    # for its own /opt/ai prefix. Unset it for the nvm operations.
+    # for its own /opt/ai-stack prefix. Unset it for the nvm operations.
     local _saved_prefix="${PREFIX:-}"
     unset PREFIX
     nvm install 24
@@ -481,7 +502,7 @@ ensure_nodejs() {
     node_bin="${node_bin%/*}"
     if [[ -n "$node_bin" && -d "$node_bin" ]]; then
         for c in node npm npx; do
-            [[ -e "$node_bin/$c" ]] && ln -sf "$node_bin/$c" "/usr/local/bin/$c"
+            [[ -e "$node_bin/$c" ]] && as_root ln -sf "$node_bin/$c" "/usr/local/bin/$c"
         done
     fi
 
@@ -503,8 +524,8 @@ ensure_build_dependencies() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         info "Installing build dependencies: ${missing[*]}"
-        apt-get update
-        apt-get install -y "${missing[@]}"
+        as_root apt-get update
+        as_root apt-get install -y "${missing[@]}"
         TEMP_PACKAGES=("${missing[@]}")
     fi
 }
@@ -512,8 +533,8 @@ ensure_build_dependencies() {
 cleanup_build_dependencies() {
     [[ ${#TEMP_PACKAGES[@]} -eq 0 ]] && return
     info "Removing temporary build dependencies..."
-    apt-get purge -y "${TEMP_PACKAGES[@]}" || true
-    apt-get autoremove -y || true
+    as_root apt-get purge -y "${TEMP_PACKAGES[@]}" || true
+    as_root apt-get autoremove -y || true
     # Make this idempotent: it may be called explicitly at end of main() and
     # again by the EXIT trap. Clearing avoids a second "not installed" purge.
     TEMP_PACKAGES=()
@@ -584,8 +605,8 @@ ensure_backend_dependencies() {
 
 ensure_vulkan_dev() {
     info "Installing Vulkan development packages..."
-    apt-get install -y libvulkan-dev glslc spirv-headers
-    ldconfig
+    as_root apt-get install -y libvulkan-dev glslc spirv-headers
+    as_root ldconfig
     has_vulkan
 }
 
@@ -604,7 +625,7 @@ ensure_cuda_toolkit() {
     # Remove Ubuntu's conflicting nvidia-cuda-toolkit if present
     if dpkg -s nvidia-cuda-toolkit >/dev/null 2>&1; then
         warn "Removing Ubuntu's nvidia-cuda-toolkit (conflicts with NVIDIA's toolkit)..."
-        apt-get purge -y nvidia-cuda-toolkit nvidia-cuda-dev 2>/dev/null || true
+        as_root apt-get purge -y nvidia-cuda-toolkit nvidia-cuda-dev 2>/dev/null || true
     fi
 
     # Ensure NVIDIA CUDA repo is present so versioned packages are discoverable
@@ -613,10 +634,10 @@ ensure_cuda_toolkit() {
         local repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64"
         local deb=/tmp/cuda-keyring.deb
         curl -fsSL "$repo/cuda-keyring_1.1-1_all.deb" -o "$deb" || return 1
-        dpkg -i "$deb" >/dev/null 2>&1 || { rm -f "$deb"; return 1; }
+        as_root dpkg -i "$deb" >/dev/null 2>&1 || { rm -f "$deb"; return 1; }
         rm -f "$deb"
     fi
-    apt-get update
+    as_root apt-get update
 
     # Recommended CUDA toolkit versions (13.1 / 13.2 are known-problematic;
     # avoid them). 12.8 is the most stable.
@@ -666,7 +687,7 @@ ensure_cuda_toolkit() {
 
     local pkg="cuda-toolkit-$selected"
     info "Installing $pkg (compatible with driver CUDA $driver_cuda_max)..."
-    apt-get install -y --no-install-recommends "$pkg" || return 1
+    as_root apt-get install -y --no-install-recommends "$pkg" || return 1
 
     export PATH="/usr/local/cuda/bin:$PATH"
     export CUDA_HOME="/usr/local/cuda"
@@ -676,7 +697,7 @@ ensure_cuda_toolkit() {
 
 ensure_hip_toolchain() {
     info "Installing HIP/ROCm toolchain from Ubuntu repositories..."
-    apt-get install -y --no-install-recommends hipcc || return 1
+    as_root apt-get install -y --no-install-recommends hipcc || return 1
     has_hip
 }
 
@@ -745,10 +766,10 @@ get_installed_version() {
 }
 
 set_installed_version() {
-    local key="$1" value="$2"
-    grep -v "^${key}=" "$VERSIONS_FILE" > "${VERSIONS_FILE}.tmp" || true
-    echo "${key}=${value}" >> "${VERSIONS_FILE}.tmp"
-    mv "${VERSIONS_FILE}.tmp" "$VERSIONS_FILE"
+    local key="$1" value="$2" tmp="$TMPDIR/versions.tmp"
+    grep -v "^${key}=" "$VERSIONS_FILE" > "$tmp" 2>/dev/null || true
+    echo "${key}=${value}" >> "$tmp"
+    as_root install -m644 "$tmp" "$VERSIONS_FILE"
 }
 
 ################################################################################
@@ -1028,7 +1049,7 @@ build_and_install() {
     targets="$(component_targets "$c")"
     bins="$(component_bins "$c")"
     links_spec="$(component_links "$c")"
-    src="$SCRIPT_DIR/$dir"
+    src="$SOURCE_DIR/$dir"
 
     info "Building $c ($dir) with backend: $backend"
 
@@ -1036,7 +1057,8 @@ build_and_install() {
 
     ensure_submodules "$src"
 
-    local build_dir="$src/build"
+    local build_dir="$BUILD_DIR/$c"
+    mkdir -p "$build_dir"
     local common_flags=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF)
 
     # Avoid stale cmake cache from a previous backend run
@@ -1083,12 +1105,12 @@ build_and_install() {
     cmake -S "$src" -B "$build_dir" "${common_flags[@]}" "${extra[@]}" $flags "${cuda_linker[@]}"
 
     info "Building targets: $targets"
-    cmake --build "$build_dir" --config Release -j"$(nproc)" --target $targets
+    cmake --build "$build_dir" --config Release -j"$BUILD_JOBS" --target $targets
 
-    # Install binaries
+    # Install binaries under $PREFIX (requires root)
     local inst="$PREFIX/$dir"
-    rm -rf "$inst"
-    mkdir -p "$inst"
+    as_root rm -rf "$inst"
+    as_root mkdir -p "$inst"
     local i=0 pairs=()
     # links_spec is "bin link bin link ..."
     local blist
@@ -1104,7 +1126,7 @@ build_and_install() {
             if [[ -f "$cand" ]]; then found="$cand"; break; fi
         done
         [[ -n "$found" ]] || die "$c: built binary $b not found under $build_dir"
-        cp "$found" "$inst/"
+        as_root install -m755 "$found" "$inst/"
     done
 
     # Create symlinks in BIN_DIR per links_spec
@@ -1132,14 +1154,14 @@ copy_shlibs() {
     done
     [[ -z "$shlib_dir" ]] && return
     # copy only libggml / project-specific libs, keep out tiny support libs
-    find "$shlib_dir" -maxdepth 1 \( -name 'libggml*.so*' -o -name 'libwhisper*.so*' -o -name 'libsd*.so*' -o -name 'libstable*.so*' -o -name 'libengine*.so*' -o -name 'libcrispasr*.so*' -o -name 'libacestep*.so*' \) -exec cp -a {} "$inst/" \; 2>/dev/null || true
+    find "$shlib_dir" -maxdepth 1 \( -name 'libggml*.so*' -o -name 'libwhisper*.so*' -o -name 'libsd*.so*' -o -name 'libstable*.so*' -o -name 'libengine*.so*' -o -name 'libcrispasr*.so*' -o -name 'libacestep*.so*' \) -exec as_root cp -a {} "$inst/" \; 2>/dev/null || true
     if find "$inst" -name '*.so*' -print -quit 2>/dev/null | grep -q .; then
-        # register this install dir for the dynamic linker (append, avoid clobber)
+        # Register this install dir for the dynamic linker
         local conf=/etc/ld.so.conf.d/ai-stack.conf
-        if [[ -w "$(dirname "$conf")" ]]; then
-            grep -qxF "$inst" "$conf" 2>/dev/null || echo "$inst" >> "$conf"
-            ldconfig 2>/dev/null || true
+        if ! grep -qxF "$inst" "$conf" 2>/dev/null; then
+            echo "$inst" | as_root tee -a "$conf" >/dev/null
         fi
+        as_root ldconfig 2>/dev/null || true
     fi
 }
 
@@ -1155,7 +1177,7 @@ record_version() {
 ################################################################################
 
 install_kokoro() {
-    local src="$SCRIPT_DIR/Kokoro-FastAPI"
+    local src="$SOURCE_DIR/Kokoro-FastAPI"
     [[ -d "$src" ]] || die "Kokoro-FastAPI source not found: $src"
 
     local device="${KOKORO_DEVICE:-auto}"
@@ -1177,8 +1199,8 @@ install_kokoro() {
     # persistently since runtime needs them.
     if ! command -v espeak-ng >/dev/null 2>&1; then
         info "Installing espeak-ng (runtime requirement)..."
-        apt-get update
-        apt-get install -y espeak-ng
+        as_root apt-get update
+        as_root apt-get install -y espeak-ng
     fi
 
     local extra
@@ -1201,12 +1223,12 @@ install_kokoro() {
 make_kokoro_launcher() {
     local src="$1"
     # launcher that runs uvicorn inside the project venv
-    cat > "$BIN_DIR/kokoro-fastapi" <<EOF
+    as_root tee "$BIN_DIR/kokoro-fastapi" >/dev/null <<EOF
 #!/usr/bin/env bash
 # Launcher for Kokoro-FastAPI
 exec "$src/.venv/bin/uv" run --project "$src" uvicorn api.src.main:app --host \${KOKORO_HOST:-0.0.0.0} --port \${KOKORO_PORT:-8880}
 EOF
-    chmod +x "$BIN_DIR/kokoro-fastapi"
+    as_root chmod +x "$BIN_DIR/kokoro-fastapi"
 }
 
 ################################################################################
@@ -1241,8 +1263,8 @@ install_llama_swap() {
     download "$url" "$archive"
 
     local dest="$PREFIX/llama-swap"
-    rm -rf "$dest"; mkdir -p "$dest"
-    tar -xzf "$archive" -C "$dest"
+    as_root rm -rf "$dest"; as_root mkdir -p "$dest"
+    as_root tar -xzf "$archive" -C "$dest"
     make_link "$dest/llama-swap" llama-swap
 
     set_installed_version LLAMA_SWAP "$version"
@@ -1256,7 +1278,7 @@ build_llama_swap_from_source() {
     [[ -d "$go_dir" ]] || die "llama-swap source not found: $go_dir"
     info "Building llama-swap from source..."
     ( cd "$go_dir" && CGO_ENABLED=0 go build -trimpath -o "$TMPDIR/llama-swap" . )
-    install -m755 "$TMPDIR/llama-swap" "$BIN_DIR/llama-swap"
+    as_root install -m755 "$TMPDIR/llama-swap" "$BIN_DIR/llama-swap"
     record_version llama-swap "$go_dir"
     install_llama_swap_service
     ok "Built llama-swap from source"
@@ -1290,19 +1312,32 @@ download() {
 }
 
 make_link() {
-    ln -sfn "$1" "$BIN_DIR/$2"
+    as_root ln -sfn "$1" "$BIN_DIR/$2"
 }
 
 ################################################################################
 # systemd service
 ################################################################################
 
+ensure_llama_swap_user() {
+    if ! id -u llama-swap >/dev/null 2>&1; then
+        info "Creating system user 'llama-swap'..."
+        as_root useradd \
+            --system \
+            --home-dir "$DATA_DIR" \
+            --shell /usr/sbin/nologin \
+            llama-swap
+    fi
+    as_root mkdir -p "$CONFIG_DIR" "$MODEL_DIR"
+    as_root chown -R llama-swap:llama-swap "$DATA_DIR"
+}
+
 install_llama_swap_service() {
     info "Installing llama-swap systemd service..."
-    mkdir -p "$CONFIG_DIR" "$MODEL_DIR"
+    ensure_llama_swap_user
     local SERVICE=/etc/systemd/system/llama-swap.service
     if [[ ! -f "$SERVICE" ]]; then
-        cat >"$SERVICE" <<EOF
+        as_root tee "$SERVICE" >/dev/null <<EOF
 [Unit]
 Description=llama-swap AI Model Router
 After=network-online.target
@@ -1310,11 +1345,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=llama-swap
+Group=llama-swap
 
-Environment="PATH=/opt/ai/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="PATH=/opt/ai-stack/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 Environment="LLAMA_CACHE=$MODEL_DIR"
 
-ExecStart=/opt/ai/bin/llama-swap \
+ExecStart=/opt/ai-stack/bin/llama-swap \
     -config $CONFIG_DIR/config.yaml \
     -listen 0.0.0.0:9999 \
     -watch-config
@@ -1327,14 +1364,14 @@ WorkingDirectory=$DATA_DIR
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable llama-swap.service 2>/dev/null || true
+        as_root systemctl daemon-reload
+        as_root systemctl enable llama-swap.service 2>/dev/null || true
         ok "Installed systemd service."
     else
         ok "Systemd service already exists."
     fi
     if systemctl is-active --quiet llama-swap.service 2>/dev/null; then
-        systemctl restart llama-swap.service 2>/dev/null || true
+        as_root systemctl restart llama-swap.service 2>/dev/null || true
     fi
 }
 
@@ -1343,19 +1380,20 @@ EOF
 ################################################################################
 
 uninstall() {
+    require_sudo
     info "Removing installed software..."
     if systemctl list-unit-files 2>/dev/null | grep -q '^llama-swap.service'; then
-        systemctl stop llama-swap.service 2>/dev/null || true
-        systemctl disable llama-swap.service 2>/dev/null || true
-        rm -f /etc/systemd/system/llama-swap.service
-        systemctl daemon-reload
+        as_root systemctl stop llama-swap.service 2>/dev/null || true
+        as_root systemctl disable llama-swap.service 2>/dev/null || true
+        as_root rm -f /etc/systemd/system/llama-swap.service
+        as_root systemctl daemon-reload
     fi
-    rm -f /etc/ld.so.conf.d/ai-stack.conf /etc/ld.so.conf.d/ai-whisper.conf
-    ldconfig 2>/dev/null || true
-    rm -rf "$PREFIX"
+    as_root rm -f /etc/ld.so.conf.d/ai-stack.conf /etc/ld.so.conf.d/ai-whisper.conf
+    as_root ldconfig 2>/dev/null || true
+    as_root rm -rf "$PREFIX"
     ok "Removed installed software."
     if [[ "${PURGE_DATA:-0}" == 1 ]]; then
-        rm -rf "$DATA_DIR"
+        as_root rm -rf "$DATA_DIR"
         ok "Removed data directory."
     else
         echo
@@ -1363,6 +1401,10 @@ uninstall() {
         echo "  $DATA_DIR"
         echo "Delete it manually or rerun with --purge-data."
     fi
+    echo
+    note "Source and build trees were kept (user-owned):"
+    note "  $SOURCE_DIR"
+    note "  $BUILD_DIR"
 }
 
 ################################################################################
@@ -1409,12 +1451,125 @@ summary() {
 }
 
 ################################################################################
+# Memory, swap, and build jobs
+################################################################################
+
+# Parallel build jobs: RAM-scaled by default, honoring --jobs, capped at nproc.
+build_jobs() {
+    local nproc_avail jobs mem_kb
+    nproc_avail="$(nproc 2>/dev/null || echo 1)"
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ -n "${BUILD_JOBS_ARG:-}" ]]; then
+        jobs="$BUILD_JOBS_ARG"
+    elif (( mem_kb < 8*1024*1024 )); then
+        jobs=2
+    elif (( mem_kb < 16*1024*1024 )); then
+        jobs=4
+    elif (( mem_kb < 32*1024*1024 )); then
+        jobs=6
+    else
+        jobs="$nproc_avail"
+    fi
+    (( jobs > nproc_avail )) && jobs="$nproc_avail"
+    (( jobs < 1 )) && jobs=1
+    echo "$jobs"
+}
+
+# Prints "ram_kb swap_kb" from /proc/meminfo and /proc/swaps.
+system_memory() {
+    local ram_kb swap_kb
+    ram_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_kb="$(awk 'NR>1 {s+=$3} END {print s+0}' /proc/swaps 2>/dev/null || echo 0)"
+    echo "$ram_kb $swap_kb"
+}
+
+check_memory() {
+    local ram_kb swap_kb combined_gb
+    read -r ram_kb swap_kb <<< "$(system_memory)"
+    combined_gb=$(( (ram_kb + swap_kb) / 1024 / 1024 ))
+    if (( combined_gb >= 16 )); then
+        ok "Memory check passed: ${combined_gb} GiB RAM+swap detected."
+        return
+    fi
+    echo
+    note "Low memory detected:"
+    note "  RAM:      $(( ram_kb / 1024 / 1024 )) GiB"
+    note "  Swap:     $(( swap_kb / 1024 / 1024 )) GiB"
+    note "  Combined: ${combined_gb} GiB"
+    note "16 GiB combined RAM+swap is recommended."
+    echo
+    if [[ "$AUTO_YES" == 1 || "$NO_SWAP" == 1 ]]; then
+        warn "Continuing with ${combined_gb} GiB RAM+swap (builds may be slow or fail)."
+        return
+    fi
+    local choice
+    choice="$(menu_choice "What would you like to do?" \
+        "Continue (16 GiB RAM+swap recommended)" \
+        "Create swapfile (${SWAP_SIZE})" \
+        "Abort")"
+    case "$choice" in
+        Continue*) warn "Continuing with ${combined_gb} GiB RAM+swap." ;;
+        Create*)   create_swapfile ;;
+        Abort*)    die "Aborting." ;;
+        *)         die "Unknown choice." ;;
+    esac
+}
+
+swap_dd() {
+    local size="$1" file="$2" blocks
+    case "$size" in
+        *G) blocks=$(( ${size%G} * 1024 )) ;;
+        *M) blocks=${size%M} ;;
+        *)  blocks=$(( size * 1024 )) ;;
+    esac
+    as_root dd if=/dev/zero of="$file" bs=1M count="$blocks" status=progress
+}
+
+create_swapfile() {
+    local size="$SWAP_SIZE"
+    local swapfile=/swapfile
+    if [[ -f "$swapfile" ]] && swapon --show --noheadings 2>/dev/null | grep -qF "$swapfile"; then
+        note "Swapfile $swapfile is already active."
+        return
+    fi
+    if [[ ! -f "$swapfile" ]]; then
+        info "Creating swapfile $swapfile of size $size..."
+        if command -v fallocate >/dev/null 2>&1; then
+            as_root fallocate -l "$size" "$swapfile" || {
+                warn "fallocate failed; using dd."
+                swap_dd "$size" "$swapfile"
+            }
+        else
+            swap_dd "$size" "$swapfile"
+        fi
+    fi
+    as_root chmod 600 "$swapfile"
+    as_root mkswap "$swapfile"
+    as_root swapon "$swapfile"
+    if ! grep -qF "$swapfile" /etc/fstab 2>/dev/null; then
+        info "Persisting swap entry in /etc/fstab..."
+        echo "$swapfile none swap sw 0 0" | as_root tee -a /etc/fstab >/dev/null
+    fi
+    ok "Swapfile $swapfile is active (${size})."
+}
+
+################################################################################
 # Main
 ################################################################################
 
 main() {
-    mkdir -p "$PREFIX" "$BIN_DIR"
-    touch "$VERSIONS_FILE"
+    require_sudo
+
+    # Preflight: check combined RAM+swap before compiling, and compute the
+    # parallel build job count (RAM-scaled, capped at nproc).
+    check_memory
+    BUILD_JOBS="$(build_jobs)"
+    note "Build jobs: $BUILD_JOBS (RAM-scaled, capped at nproc)"
+    echo
+
+    as_root mkdir -p "$PREFIX" "$BIN_DIR"
+    as_root touch "$VERSIONS_FILE"
+    mkdir -p "$SOURCE_DIR" "$BUILD_DIR"
 
     # remember CLI-provided overrides so load_config does not clobber them
     local cli_kokoro="${KOKORO_DEVICE:-}"
