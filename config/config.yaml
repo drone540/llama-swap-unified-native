@@ -1,0 +1,19 @@
+# Default llama-swap configuration installed by the ai-stack installer.
+# ${PORT} is substituted by llama-swap at runtime (per-model port), so it must
+# be written literally in this file and must NOT be expanded by a shell.
+models:
+  gemma-4-E2B:
+    filters:
+      stripParams: "temperature, top_k, top_p, repeat_penalty, min_p, presence_penalty"
+    capabilities:
+      in: [text, image, audio]
+      out: [text]
+      tools: true
+      context: 131072
+    cmd: |
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      --temp 1.0 --top-p 0.95 --top-k 64
+      -hf unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+      --spec-type draft-mtp
+      --spec-draft-n-max 4 --spec-draft-p-min 0.75

@@ -1454,11 +1454,95 @@ ensure_llama_swap_user() {
     as_root chown -R llama-swap:llama-swap "$DATA_DIR"
 }
 
+# Install the default llama-swap config ($CONFIG_DIR/config.yaml) from the
+# repository's config/config.yaml when none exists yet, then append the
+# kokoro-tts model entry when Kokoro is installed. ${PORT} is expanded by
+# llama-swap at runtime, so it must be written literally into the YAML; every
+# heredoc in here is therefore quoted to stop the shell from touching it.
+install_llama_swap_config() {
+    as_root mkdir -p "$CONFIG_DIR"
+    local cfg="$CONFIG_DIR/config.yaml"
+    if [[ ! -s "$cfg" ]]; then
+        local src
+        src="$(dirname "$0")/config/config.yaml"
+        if [[ -f "$src" ]]; then
+            info "Installing default llama-swap config from $src"
+            as_root install -m0644 "$src" "$cfg"
+        else
+            warn "config/config.yaml not found next to the installer; writing embedded default."
+            as_root tee "$cfg" >/dev/null <<'CFG'
+models:
+  gemma-4-E2B:
+    filters:
+      stripParams: "temperature, top_k, top_p, repeat_penalty, min_p, presence_penalty"
+    capabilities:
+      in: [text, image, audio]
+      out: [text]
+      tools: true
+      context: 131072
+    cmd: |
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      --temp 1.0 --top-p 0.95 --top-k 64
+      -hf unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+      --spec-type draft-mtp
+      --spec-draft-n-max 4 --spec-draft-p-min 0.75
+CFG
+        fi
+        as_root chown llama-swap:llama-swap "$cfg"
+        ok "Default llama-swap config installed."
+    fi
+
+    # Only add kokoro-tts when Kokoro is actually installed.
+    if [[ -f "$BIN_DIR/kokoro-fastapi" ]] && ! grep -qs '^  kokoro-tts:' "$cfg"; then
+        info "Adding kokoro-tts model to llama-swap config."
+        # Never glue the entry onto an existing line: ensure a trailing newline.
+        if [[ -s "$cfg" ]] && [[ "$(tail -c1 "$cfg")" != "$(printf '\n')" ]]; then
+            as_root tee -a "$cfg" >/dev/null <<'NL'
+NL
+        fi
+        as_root tee -a "$cfg" >/dev/null <<'KOKOROCFG'
+  kokoro-tts:
+    useModelName: "tts-1"
+    capabilities:
+      in: [text]
+      out: [audio]
+    cmd: |
+      /bin/bash -c 'export KOKORO_HOST=127.0.0.1; export KOKORO_PORT=${PORT}; exec /opt/ai-stack/bin/kokoro-fastapi'
+    proxy: http://127.0.0.1:${PORT}
+KOKOROCFG
+        as_root chown llama-swap:llama-swap "$cfg"
+        ok "kokoro-tts added to llama-swap config."
+    fi
+}
+
+# Grant the llama-swap service user traverse access to the real user's home so
+# it can reach Kokoro's venv python. Only /home/<user> is touched, and only
+# when Kokoro is installed. Never chmod 777 or chown the home directory.
+fix_kokoro_permissions() {
+    [[ -f "$BIN_DIR/kokoro-fastapi" ]] || return 0
+    local venv_py="$SOURCE_DIR/Kokoro-FastAPI/.venv/bin/python"
+    if [[ ! -x "$venv_py" ]]; then
+        warn "Kokoro launcher present but venv python not found ($venv_py); skipping ACL."
+        return 0
+    fi
+    if ! command -v setfacl >/dev/null 2>&1; then
+        warn "setfacl not available; skipping Kokoro permission fix."
+        return 0
+    fi
+    as_root setfacl -m u:llama-swap:x "$HOME"
+    ok "Granted llama-swap traverse access to $HOME (ACL)."
+}
+
 install_llama_swap_service() {
     info "Installing llama-swap systemd service..."
     ensure_llama_swap_user
+    install_llama_swap_config
+    fix_kokoro_permissions
     local SERVICE=/etc/systemd/system/llama-swap.service
-    if [[ ! -f "$SERVICE" ]]; then
+    # Write the unit unless it already points at our bin dir; a leftover unit
+    # from the old /opt/ai prefix is rewritten to the current one.
+    if [[ ! -f "$SERVICE" ]] || ! grep -qs "$BIN_DIR/llama-swap" "$SERVICE"; then
         as_root tee "$SERVICE" >/dev/null <<EOF
 [Unit]
 Description=llama-swap AI Model Router
@@ -1470,10 +1554,10 @@ Type=simple
 User=llama-swap
 Group=llama-swap
 
-Environment="PATH=/opt/ai-stack/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="PATH=$BIN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 Environment="LLAMA_CACHE=$MODEL_DIR"
 
-ExecStart=/opt/ai-stack/bin/llama-swap \
+ExecStart=$BIN_DIR/llama-swap \
     -config $CONFIG_DIR/config.yaml \
     -listen 0.0.0.0:9999 \
     -watch-config
@@ -1487,13 +1571,18 @@ WorkingDirectory=$DATA_DIR
 WantedBy=multi-user.target
 EOF
         as_root systemctl daemon-reload
-        as_root systemctl enable llama-swap.service 2>/dev/null || true
         ok "Installed systemd service."
     else
         ok "Systemd service already exists."
     fi
+    # Enabled at boot; restart if it is running, otherwise start it now.
+    as_root systemctl enable llama-swap.service 2>/dev/null || true
     if systemctl is-active --quiet llama-swap.service 2>/dev/null; then
+        info "llama-swap is running; restarting to pick up changes."
         as_root systemctl restart llama-swap.service 2>/dev/null || true
+    else
+        info "llama-swap is not running; starting it now."
+        as_root systemctl start llama-swap.service 2>/dev/null || true
     fi
 }
 
