@@ -159,16 +159,29 @@ echo 'export PATH=/opt/ai-stack/bin:$PATH' >> ~/.bashrc
   the git tag at or near the checked-out revision (e.g. `b10733`, `v1.9.3`,
   `v0.8.31`), falling back to the commit hash when a repo has no tags. These
   change only when upstream cuts a new release.
+- **Already-current components are skipped.** If a component's recorded version
+  still matches the version currently checked out in its clone, and its installed
+  binary is still on disk, the build is skipped (`<comp> is already up to date`).
+  Pass `--reconfigure` to force a rebuild (e.g. after changing a backend).
 - **Kokoro** creates its venv with uv, downloads the model weights, and (on
   confirmation, default yes) the ~526MB UniDic dictionary for **Japanese TTS**.
-  The `kokoro-fastapi` launcher runs uvicorn from the project's `.venv` (no `uv`
-  needed at runtime), and the build-only packages (`python3-dev`, `python3-venv`)
-  are purged after the install finishes.
+  The dictionary is only downloaded when it is actually missing from the venv, so
+  repeated installs don't re-fetch it. The `kokoro-fastapi` launcher runs uvicorn
+  from the project's `.venv` (no `uv` needed at runtime), and the build-only
+  packages (`python3-dev`, `python3-venv`) are purged after the install finishes.
+- **Builds are tuned for this machine.** CMake builds use `GGML_NATIVE=ON` (code
+  is optimized for the local CPU) and CUDA builds add
+  `GGML_CUDA_FA_ALL_QUANTS=ON` for full flash-attention coverage.
+- **sd-server's webui is built.** If `sd` is selected, Node 24 (via nvm) is
+  installed and pnpm is enabled through corepack into `~/.local/bin` so the
+  webui frontend (`examples/server/frontend`) is compiled in. A pre-built
+  `gen_index_html.h` is used as a fallback if pnpm is unavailable.
 - **Selections are saved before building**, so a failed build doesn't discard
   your component/backend choices; the next run resumes from them.
 - Components are compiled locally, so builds take time; only the components you
-  select are built. Parallelism is RAM-scaled by default (`--jobs N` to override,
-  capped at your CPU count).
+  select are built. Parallelism is scaled off total RAM+swap (1 job under 4 GiB,
+  2 under 6 GiB, 3 under 8 GiB, 4 under 12 GiB, 6 under 16 GiB, else all cores;
+  `--jobs N` to override, capped at your CPU count).
 - `--uninstall` removes the installed software and the systemd service but leaves
   your source clones, build cache, and downloaded models unless you pass
   `--purge-data`.

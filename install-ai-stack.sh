@@ -467,6 +467,21 @@ ensure_runtime_dependencies() {
 # Node.js is required for the llama-swap web UI. Ubuntu's nodejs is often
 # too old (v18/v20); we guarantee Node 24+ by removing the distro package and
 # installing the official Node via nvm.
+# Enable the pnpm shims (sd-server's webui frontend is a pnpm project and is
+# built during `cmake --build`). pnpm ships with Node via corepack. We write
+# the shims into the user's writable ~/.local/bin (the nvm node dir is often
+# root-owned, which makes `corepack enable` fail there), then symlink them
+# into /usr/local/bin like node/npm/npx.
+enable_pnpm() {
+    command -v corepack >/dev/null 2>&1 || return
+    mkdir -p "$HOME/.local/bin"
+    corepack enable --install-directory "$HOME/.local/bin" pnpm 2>/dev/null || true
+    for c in pnpm pnpx; do
+        [[ -e "$HOME/.local/bin/$c" ]] && as_root ln -sf "$HOME/.local/bin/$c" "/usr/local/bin/$c"
+    done
+    command -v pnpm >/dev/null 2>&1 && ok "pnpm ready: $(pnpm -v 2>/dev/null)" || warn "pnpm not available (corepack enable pnpm failed)."
+}
+
 ensure_nodejs() {
     # If a current, recent node is already on PATH, nothing to do.
     if command -v node >/dev/null 2>&1; then
@@ -476,6 +491,7 @@ ensure_nodejs() {
         local major="${cur%%.*}"
         if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 24 )); then
             ok "Node.js already at $cur (>= 24 required)"
+            enable_pnpm
             return 0
         fi
         warn "Node.js $cur is too old (need >= 24); replacing with official Node 24 via nvm."
@@ -518,6 +534,8 @@ ensure_nodejs() {
             [[ -e "$node_bin/$c" ]] && as_root ln -sf "$node_bin/$c" "/usr/local/bin/$c"
         done
     fi
+
+    enable_pnpm
 
     if command -v node >/dev/null 2>&1; then
         ok "Node.js ready: $(node -v) / npm $(npm -v)"
@@ -999,9 +1017,9 @@ ggml_backend_flags() {
     case "$backend" in
         cpu)    return 0 ;;                      # no flag, ggml CPU is default
         cuda)   case "$style" in
-                    sd)  echo "-DSD_CUDA=ON -DGGML_CUDA=ON" ;;
-                    audio) echo "-DENGINE_ENABLE_CUDA=ON -DGGML_CUDA=ON" ;;
-                    *)   echo "-DGGML_CUDA=ON" ;;
+                    sd)  echo "-DSD_CUDA=ON -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON" ;;
+                    audio) echo "-DENGINE_ENABLE_CUDA=ON -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON" ;;
+                    *)   echo "-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON" ;;
                 esac ;;
         vulkan) case "$style" in
                     sd)  echo "-DSD_VULKAN=ON -DGGML_VULKAN=ON" ;;
@@ -1072,7 +1090,7 @@ build_and_install() {
 
     local build_dir="$BUILD_DIR/$c"
     mkdir -p "$build_dir"
-    local common_flags=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF)
+    local common_flags=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF)
 
     # Avoid stale cmake cache from a previous backend run
     rm -rf "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles" 2>/dev/null || true
@@ -1190,6 +1208,39 @@ record_version() {
     set_installed_version "$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')" "$ver"
 }
 
+# True (0) when component $1 is already built at the current source version,
+# so the rebuild can be skipped. Mirrors record_version's tag logic and is
+# gated on --reconfigure, which forces a fresh build (e.g. after the user
+# picks a different backend). Also requires the installed binary to exist on
+# disk so a wiped $PREFIX still triggers a (re)install.
+is_up_to_date() {
+    [[ "$RECONFIGURE" == 1 ]] && return 1
+    local c="$1" dir src
+    dir="$(component_dir "$c")"
+    src="$SOURCE_DIR/$dir"
+    [[ -d "$src" ]] || return 1
+
+    local key inst cur
+    key="$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')"
+    inst="$(get_installed_version "$key" || true)"
+    [[ -n "$inst" ]] || return 1
+
+    cur="$(git -C "$src" describe --tags --exact-match 2>/dev/null || true)"
+    [[ -z "$cur" ]] && cur="$(git -C "$src" describe --tags --abbrev=0 2>/dev/null || true)"
+    [[ -z "$cur" ]] && cur="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || true)"
+    [[ -n "$cur" && "$cur" == "$inst" ]] || return 1
+
+    if [[ "$c" == "kokoro" ]]; then
+        [[ -x "$src/.venv/bin/python" && -x "$BIN_DIR/kokoro-fastapi" ]] || return 1
+        return 0
+    fi
+
+    local probe
+    probe="$(component_bins "$c" | awk '{print $1}')"
+    [[ -n "$probe" && -f "$PREFIX/$dir/$probe" ]] || return 1
+    return 0
+}
+
 ################################################################################
 # Kokoro-FastAPI (Python)
 ################################################################################
@@ -1251,7 +1302,13 @@ install_kokoro() {
     fi
 
     # Japanese TTS needs the UniDic dictionary (~526MB) for fugashi/MeCab.
-    if confirm "Download the Japanese dictionary (UniDic, ~526MB) for Japanese TTS support?" y; then
+    # `python -m unidic download` always wipes and re-downloads the ~526MB
+    # dict, so only fetch it when it is actually missing from the venv.
+    local unidic_dir
+    unidic_dir="$("$src/.venv/bin/python" -c "import os, unidic; print(os.path.dirname(os.path.abspath(unidic.__file__)))" 2>/dev/null || true)"
+    if [[ -n "$unidic_dir" && -d "$unidic_dir/dicdir" && -f "$unidic_dir/dicdir/lex.csv" ]]; then
+        ok "UniDic dictionary already present, skipping download."
+    elif confirm "Download the Japanese dictionary (UniDic, ~526MB) for Japanese TTS support?" y; then
         info "Downloading UniDic dictionary for Japanese support..."
         "$src/.venv/bin/python" -m unidic download || warn "UniDic download failed; Japanese TTS will be unavailable."
     fi
@@ -1519,21 +1576,29 @@ summary() {
 # Memory, swap, and build jobs
 ################################################################################
 
-# Parallel build jobs: RAM-scaled by default, honoring --jobs, capped at nproc.
+# Parallel build jobs: scaled off total RAM+swap (tights thresholds), honoring
+# --jobs, always capped at nproc.
 build_jobs() {
-    local nproc_avail jobs mem_kb
+    local nproc_avail jobs ram_kb swap_kb combined_gb
     nproc_avail="$(nproc 2>/dev/null || echo 1)"
-    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     if [[ -n "${BUILD_JOBS_ARG:-}" ]]; then
         jobs="$BUILD_JOBS_ARG"
-    elif (( mem_kb < 8*1024*1024 )); then
-        jobs=2
-    elif (( mem_kb < 16*1024*1024 )); then
-        jobs=4
-    elif (( mem_kb < 32*1024*1024 )); then
-        jobs=6
     else
-        jobs="$nproc_avail"
+        read -r ram_kb swap_kb <<< "$(system_memory)"
+        combined_gb=$(( (ram_kb + swap_kb) / 1024 / 1024 ))
+        if (( combined_gb < 4 )); then
+            jobs=1
+        elif (( combined_gb < 6 )); then
+            jobs=2
+        elif (( combined_gb < 8 )); then
+            jobs=3
+        elif (( combined_gb < 12 )); then
+            jobs=4
+        elif (( combined_gb < 16 )); then
+            jobs=6
+        else
+            jobs="$nproc_avail"
+        fi
     fi
     (( jobs > nproc_avail )) && jobs="$nproc_avail"
     (( jobs < 1 )) && jobs=1
@@ -1748,10 +1813,10 @@ main() {
 
     # Preflight now that components are known: warn on low RAM+swap, and only
     # offer extra swap when the heavy audio.cpp build is selected. Also pick
-    # the parallel build job count (RAM-scaled, capped at nproc).
+    # the parallel build job count (RAM+swap-scaled, capped at nproc).
     check_memory
     BUILD_JOBS="$(build_jobs)"
-    note "Build jobs: $BUILD_JOBS (RAM-scaled, capped at nproc)"
+    note "Build jobs: $BUILD_JOBS (RAM+swap-scaled, capped at nproc)"
     echo
 
     ensure_source_repos
@@ -1765,6 +1830,12 @@ main() {
 
     local built_any=0
     for c in "${INSTALL_LIST[@]}"; do
+        if is_up_to_date "$c"; then
+            local ckey
+            ckey="$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')"
+            ok "$c is already up to date at $(get_installed_version "$ckey")"
+            continue
+        fi
         case "$c" in
             llama|ik-llama|sd|whisper|acestep|audio|crispasr)
                 build_and_install "$c"; built_any=1 ;;
