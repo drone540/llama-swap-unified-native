@@ -473,13 +473,27 @@ ensure_runtime_dependencies() {
 # root-owned, which makes `corepack enable` fail there), then symlink them
 # into /usr/local/bin like node/npm/npx.
 enable_pnpm() {
-    command -v corepack >/dev/null 2>&1 || return
+    # Best-effort/optional: pnpm is only needed to build the sd-server webui,
+    # so a missing/broken Corepack or pnpm must never abort the installer
+    # under `set -e`. Always return success.
+    if ! command -v corepack >/dev/null 2>&1; then
+        warn "Corepack is not available; skipping pnpm setup."
+        return 0
+    fi
     mkdir -p "$HOME/.local/bin"
-    corepack enable --install-directory "$HOME/.local/bin" pnpm 2>/dev/null || true
+    if ! corepack enable --install-directory "$HOME/.local/bin" pnpm 2>/dev/null; then
+        warn "corepack enable pnpm failed; skipping pnpm setup."
+        return 0
+    fi
     for c in pnpm pnpx; do
         [[ -e "$HOME/.local/bin/$c" ]] && as_root ln -sf "$HOME/.local/bin/$c" "/usr/local/bin/$c"
     done
-    command -v pnpm >/dev/null 2>&1 && ok "pnpm ready: $(pnpm -v 2>/dev/null)" || warn "pnpm not available (corepack enable pnpm failed)."
+    if command -v pnpm >/dev/null 2>&1; then
+        ok "pnpm ready: $(pnpm -v 2>/dev/null)"
+    else
+        warn "pnpm not available (corepack enable pnpm failed)."
+    fi
+    return 0
 }
 
 ensure_nodejs() {
