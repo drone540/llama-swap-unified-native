@@ -458,6 +458,10 @@ ensure_runtime_dependencies() {
     for c in curl jq tar unzip; do
         command -v "$c" >/dev/null 2>&1 || missing+=("$c")
     done
+    # libssl-dev gives curl OpenSSL support on minimal images where curl is
+    # present but lacks TLS, and is needed by SSL-using builds. Check it even
+    # when curl itself is already installed.
+    dpkg -s libssl-dev >/dev/null 2>&1 || missing+=(libssl-dev)
     [[ ${#missing[@]} -eq 0 ]] && return
     info "Installing runtime dependencies..."
     as_root apt-get update
@@ -650,7 +654,7 @@ ensure_backend_dependencies() {
 
 ensure_vulkan_dev() {
     info "Installing Vulkan development packages..."
-    as_root apt-get install -y libvulkan-dev glslc spirv-headers
+    as_root apt-get install -y libvulkan-dev glslang-tools spirv-tools spirv-headers
     as_root ldconfig
     has_vulkan
 }
