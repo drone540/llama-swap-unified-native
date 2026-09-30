@@ -34,11 +34,15 @@ LLAMA_SWAP_DIR="$SOURCE_DIR/llama-swap"
 TMPDIR="$(mktemp -d)"
 TEMP_PACKAGES=()
 TEMP_SWAPFILE=""
+SUDO_KEEPALIVE_PID=""
 
 # Single EXIT hook. Functions used for cleanup may not be defined yet when the
 # script bails during early arg parsing, hence the declare -F guards.
 on_exit() {
     rm -rf "$TMPDIR"
+    if declare -F cleanup_sudo >/dev/null; then
+        cleanup_sudo
+    fi
     if declare -F cleanup_temporary_swap >/dev/null; then
         cleanup_temporary_swap
     fi
@@ -76,7 +80,27 @@ as_root() {
 }
 
 require_sudo() {
+    # Prompt for the sudo password once, then keep the sudo timestamp alive in
+    # the background so long builds never trigger a second password prompt.
+    # Non-interactive (-n) refresh: if sudo ever stops accepting the cached
+    # credentials the keepalive silently exits. The password is never handled
+    # by this script - sudo authenticates on its own.
     sudo -v
+    (
+        while true; do
+            sleep 60
+            sudo -n -v 2>/dev/null || exit 0
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+cleanup_sudo() {
+    if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        SUDO_KEEPALIVE_PID=""
+    fi
 }
 
 ################################################################################
