@@ -243,6 +243,23 @@ ensure_source_repo() {
     mkdir -p "$SOURCE_DIR"
 
     if [[ -f "$dir/.git/HEAD" ]]; then
+        # Existing checkout: refresh it from origin so the version check in
+        # is_up_to_date sees upstream's latest state. Without this fetch the
+        # recorded version is compared to the same frozen clone forever, so
+        # updates are never detected. Blocker/detached/dirty/offline cases are
+        # non-fatal - we just keep the existing checkout.
+        local head=""
+        head="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        if [[ -z "$head" ]] || [[ "$head" == "HEAD" ]]; then
+            warn "$name: checkout is not on a branch; skipping update."
+        elif [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+            warn "$name: local modifications in $dir; keeping them, skipping update."
+        elif git -C "$dir" fetch origin --prune 2>/dev/null; then
+            git -C "$dir" reset --hard --quiet "origin/$head" 2>/dev/null || \
+                warn "$name: could not fast-forward checkout; using existing sources."
+        else
+            warn "Could not fetch updates for $name; using existing checkout."
+        fi
         return 0
     fi
     if [[ -e "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
@@ -1238,14 +1255,16 @@ copy_shlibs() {
     fi
 }
 
-# Record the release this checkout is based on: exactly-on-tag, falling back to
-# the nearest reachable tag, then the short commit hash. Release-based values
-# change only when upstream ships a new tagged release, unlike a raw HEAD hash.
+# Record the release this checkout is based on: exactly-on-tag, otherwise the
+# tag with the commit distance+hash (e.g. b7324-12-gabcdef1), then the short
+# commit hash as a fallback. The distance term makes even rolling commits made
+# after a release register as a new version, so is_up_to_date() can detect
+# upstream updates between tags.
 record_version() {
     local c="$1" src="$2"
     local ver=""
     ver="$(git -C "$src" describe --tags --exact-match 2>/dev/null || true)"
-    [[ -z "$ver" ]] && ver="$(git -C "$src" describe --tags --abbrev=0 2>/dev/null || true)"
+    [[ -z "$ver" ]] && ver="$(git -C "$src" describe --tags 2>/dev/null || true)"
     [[ -z "$ver" ]] && ver="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     set_installed_version "$(tr 'a-z-' 'A-Z_' <<< "$c" | sed 's/-/_/g')" "$ver"
 }
@@ -1268,7 +1287,7 @@ is_up_to_date() {
     [[ -n "$inst" ]] || return 1
 
     cur="$(git -C "$src" describe --tags --exact-match 2>/dev/null || true)"
-    [[ -z "$cur" ]] && cur="$(git -C "$src" describe --tags --abbrev=0 2>/dev/null || true)"
+    [[ -z "$cur" ]] && cur="$(git -C "$src" describe --tags 2>/dev/null || true)"
     [[ -z "$cur" ]] && cur="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || true)"
     [[ -n "$cur" && "$cur" == "$inst" ]] || return 1
 
