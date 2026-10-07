@@ -15,6 +15,8 @@ build/
 
 # Other install-ai4.sh rewrite kept around
 install-ai4.sh
+list-all-repos.sh
+start_audiocpp_with_models_root.sh
 
 # editor / OS cruft
 .DS_Store

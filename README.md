@@ -14,7 +14,7 @@ selected interactively and stored for reuse.
 | `sd`       | stable-diffusion.cpp image generation | `sd-server`, `sd-cli` |
 | `whisper`  | whisper.cpp speech-to-text | `whisper-server`, `whisper-cli` |
 | `kokoro`   | Kokoro-FastAPI text-to-speech (Python service) | pip env |
-| `crispasr` | CrispASR speech-to-text | `crispasr`, `crispasr-server` |
+| `crispasr` | CrispASR speech-to-text | `crispasr` |
 | `acestep`  | acestep.cpp audio | `ace-server` |
 | `audio`    | audio.cpp audio (OpenAI-compatible TTS/ASR) | `audiocpp_cli`, `audiocpp_server` |
 
@@ -46,8 +46,23 @@ the specific operations that genuinely need root (system packages, the
 `/opt/ai-stack` tree, the systemd service, swap files). All building, cloning,
 and package downloads happen under your account.
 
-On the **first run** you are asked which components to install, then which
-compute backend each should use. Choices are saved to `/opt/ai-stack/stack.conf`.
+On the **first run** you first choose an install mode (build from source, or
+download prebuilt release binaries), then which components to install, then
+which compute backend each should use. Choices are saved to
+`/opt/ai-stack/stack.conf`. The sudo password is only requested after the
+selection prompts, and build dependencies are only installed for the
+"build from source" mode. CUDA builds are downloaded as two archives (the
+binaries plus the companion `cudart-*` CUDA runtime libraries) and unpacked
+together into the component's directory, so no system CUDA toolkit is needed.
+
+Release archives are extracted with their directory layout intact under
+`/opt/ai-stack/<component>`, and only the binaries are symlinked into
+`/opt/ai-stack/bin`. No `ldconfig` registration is performed for release
+builds, and no system library paths are modified. For components that publish
+per-instruction-set CPU builds (ik_llama, CrispASR), the best archive the
+host CPU can actually run is chosen (preferring AVX2, AVX512, AVX512-VNNI,
+AVX512-VNNI-VBMI and, when supported, BF16 variants) — an archive requiring
+instructions the machine lacks is never selected.
 
 On **later runs** the saved config is reused automatically — nothing is
 re-asked. To change your choices:
@@ -68,6 +83,8 @@ re-asked. To change your choices:
 | `--jobs N` | Number of parallel build jobs (default: auto by RAM, capped at nproc) |
 | `--swap-size SIZE` | Swap file size offered by the low-memory prompt (default `8G`) |
 | `--no-swap` | Never create or prompt about swap files |
+| `--release` | Download prebuilt release binaries instead of compiling (no build toolchains needed); components without release archives are skipped |
+| `--build` | Build everything from source (default) |
 | `-y`, `--yes` | Skip all prompts, using saved config + defaults |
 | `--reconfigure` | Re-ask components and backends even if a config exists |
 | `--uninstall` | Remove installed AI software |
