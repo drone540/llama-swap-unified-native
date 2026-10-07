@@ -1215,6 +1215,13 @@ build_and_install() {
             extra+=(
                 -DAUDIOCPP_DEPLOYMENT_BUILD=ON
                 -DAUDIOCPP_MODEL_SET=full
+                -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=ON
+                # In-process server frontends (owned by the external
+                # audio.cpp-server-frontends submodule): adds mp3_encode among
+                # others, pulling in private deps such as miniaudio/libmp3lame.
+                -DAUDIOCPP_BUILD_SERVER_FRONTENDS=ON
+                -DAUDIOCPP_SERVER_FRONTENDS_DIR=external/audio.cpp-server-frontends
+                -DAUDIOCPP_SERVER_FRONTEND_MODULES="audio_decode;mp3_encode"
                 -DENGINE_ENABLE_NATIVE_CPU=OFF
                 -DENGINE_ENABLE_OPENMP=ON
                 -DENGINE_BUILD_EXAMPLES=OFF
