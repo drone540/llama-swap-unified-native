@@ -1104,7 +1104,11 @@ ensure_submodules() {
     [[ -f "$src/.gitmodules" ]] || return 0
     [[ -d "$src/.git" ]] || return 0
     info "Ensuring git submodules in $(basename "$src")..."
-    git -C "$src" submodule update --init --recursive --depth=1 2>/dev/null || \
+    # Fetch submodule URLs via HTTPS even when .gitmodules lists git@ URLs
+    # (audio.cpp-server-frontends does), so no GitHub SSH key is required.
+    git -C "$src" \
+        -c 'url.https://github.com/.insteadOf=git@github.com:' \
+        submodule update --init --recursive --depth=1 2>/dev/null || \
         warn "Submodule update skipped/failed for $(basename "$src") (may still build if vendored deps present)."
 }
 
