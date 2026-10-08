@@ -1170,6 +1170,20 @@ cuda_linker_flags() {
     echo "-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lcuda"
 }
 
+# audio.cpp runtime + build dependencies. espeak-ng (shared phonemizer adapter)
+# and libmp3lame0 (.so.0 for the mp3_encode frontend) are persistent runtime
+# deps; libmp3lame-dev is build-only (headers) and gets purged afterwards, but
+# libmp3lame0 is kept explicitly so apt autoremove never removes it.
+ensure_audio_deps() {
+    info "Installing audio.cpp dependencies (espeak-ng, libmp3lame)..."
+    as_root apt-get update
+    as_root apt-get install -y espeak-ng libmp3lame0
+    if ! dpkg -s libmp3lame-dev >/dev/null 2>&1; then
+        as_root apt-get install -y libmp3lame-dev
+        TEMP_PACKAGES+=(libmp3lame-dev)
+    fi
+}
+
 build_and_install() {
     # $1 = component key
     local c="$1"
@@ -1235,6 +1249,8 @@ build_and_install() {
             ;;
         *) die "no build style for $c" ;;
     esac
+
+    [[ "$c" == "audio" ]] && ensure_audio_deps
 
     flags="$(backend_cmake_flags "$backend" "$style")"
 
