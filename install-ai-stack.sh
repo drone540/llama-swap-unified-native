@@ -2025,7 +2025,7 @@ create_temporary_swapfile() {
 
 # Remove and delete the temporary swapfile, if one was created this run.
 cleanup_temporary_swap() {
-    [[ -n "${TEMP_SWAPFILE:-}" ]] || return
+    [[ -n "${TEMP_SWAPFILE:-}" ]] || return 0
     if swapon --show --noheadings 2>/dev/null | grep -qF "$TEMP_SWAPFILE"; then
         note "Removing temporary swapfile $TEMP_SWAPFILE..."
         as_root swapoff "$TEMP_SWAPFILE" 2>/dev/null || true
