@@ -7,8 +7,10 @@
 # selected interactively and persisted in /opt/ai-stack/stack.conf so a later
 # run reuses your choices.
 #
-# This installer must be run as a NORMAL (non-root) user. Everything it needs
-# root for (system packages, /opt/ai-stack, systemd, swap) is run through sudo.
+# This installer is designed to run as a NORMAL (non-root) user: everything it
+# needs root for (system packages, /opt/ai-stack, systemd, swap) is run through
+# sudo. It also works when started as root (e.g. a Proxmox VE shell, which has
+# no sudo by default), running privileged actions directly instead.
 
 set -euo pipefail
 
@@ -28,6 +30,7 @@ MODEL_DIR="$DATA_DIR/models"
 SWAP_SIZE="${SWAP_SIZE:-8G}"
 NO_SWAP="${NO_SWAP:-0}"
 BUILD_JOBS_ARG=""
+LLAMA_SWAP_PORT="${LLAMA_SWAP_PORT:-9999}"
 
 LLAMA_SWAP_DIR="$SOURCE_DIR/llama-swap"
 
@@ -70,13 +73,18 @@ ok()    { echo -e "${GREEN}==>${NC} $*"; }
 warn()  { echo -e "${YELLOW}==>${NC} $*"; }
 die()   { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
 
-# Never run the installer itself as root. Privileged actions go through sudo.
-if [[ $EUID -eq 0 ]]; then
-    die "Do not run this installer with sudo. Run it as a normal user."
-fi
+# Privileged actions run through sudo when available. If the installer is
+# already running as root (e.g. a Proxmox VE shell where sudo may be absent),
+# they run directly instead.
+RUNNING_AS_ROOT=0
+[[ $EUID -eq 0 ]] && RUNNING_AS_ROOT=1
 
 as_root() {
-    sudo "$@"
+    if [[ "$RUNNING_AS_ROOT" == 1 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
 }
 
 require_sudo() {
@@ -84,7 +92,9 @@ require_sudo() {
     # the background so long builds never trigger a second password prompt.
     # Non-interactive (-n) refresh: if sudo ever stops accepting the cached
     # credentials the keepalive silently exits. The password is never handled
-    # by this script - sudo authenticates on its own.
+    # by this script - sudo authenticates on its own. When already root there
+    # is nothing to cache, so this is a no-op.
+    [[ "$RUNNING_AS_ROOT" == 1 ]] && return 0
     sudo -v
     (
         while true; do
@@ -134,6 +144,7 @@ Options:
                              crispasr, acestep, audio
   --kokoro-device D  Kokoro device: gpu, gpu-cu128, cpu, rocm (default auto).
   --cuda-archs AR   CUDA architectures for CUDA builds (default native).
+  --port N          TCP port for the llama-swap API (default ${LLAMA_SWAP_PORT}).
   --jobs N          Number of parallel build jobs (default: auto by RAM, cap nproc).
   --swap-size SIZE  Swap file size offered by the low-memory prompt (default
                     ${SWAP_SIZE}, e.g. 8G).
@@ -177,6 +188,11 @@ while [[ $# -gt 0 ]]; do
         --cuda-archs)
             [[ $# -lt 2 ]] && die "--cuda-archs requires a value"
             CUDA_ARCHS="$2"; CUDA_ARCHS_ARG=1; shift 2 ;;
+        --port)
+            [[ $# -lt 2 ]] && die "--port requires a number"
+            [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) \
+                || die "--port must be a number between 1 and 65535"
+            LLAMA_SWAP_PORT="$2"; shift 2 ;;
         --jobs)
             [[ $# -lt 2 ]] && die "--jobs requires a number"
             BUILD_JOBS_ARG="$2"; shift 2 ;;
@@ -499,6 +515,7 @@ BACKEND_AUDIO=$BACKEND_AUDIO
 BACKEND_CRISPASR=$BACKEND_CRISPASR
 KOKORO_DEVICE=$KOKORO_DEVICE
 CUDA_ARCHS=$CUDA_ARCHS
+LLAMA_SWAP_PORT=$LLAMA_SWAP_PORT
 EOF
 }
 
@@ -515,6 +532,10 @@ ensure_runtime_dependencies() {
     # present but lacks TLS, and is needed by SSL-using builds. Check it even
     # when curl itself is already installed.
     dpkg -s libssl-dev >/dev/null 2>&1 || missing+=(libssl-dev)
+    # libgomp1 is the OpenMP runtime several components (audio.cpp, ggml
+    # backends) link against; needed both by builds and by prebuilt release
+    # binaries on minimal images.
+    dpkg -s libgomp1 >/dev/null 2>&1 || missing+=(libgomp1)
     [[ ${#missing[@]} -eq 0 ]] && return
     info "Installing runtime dependencies..."
     as_root apt-get update
@@ -1703,9 +1724,12 @@ install_llama_swap_service() {
     install_llama_swap_config
     fix_kokoro_permissions
     local SERVICE=/etc/systemd/system/llama-swap.service
-    # Write the unit unless it already points at our bin dir; a leftover unit
-    # from the old /opt/ai prefix is rewritten to the current one.
-    if [[ ! -f "$SERVICE" ]] || ! grep -qs "$BIN_DIR/llama-swap" "$SERVICE"; then
+    # Write the unit unless it already points at our bin dir and listen port; a
+    # leftover unit from the old /opt/ai prefix or a previous --port is
+    # rewritten.
+    if [[ ! -f "$SERVICE" ]] \
+        || ! grep -qs "$BIN_DIR/llama-swap" "$SERVICE" \
+        || ! grep -qs -- "-listen 0.0.0.0:$LLAMA_SWAP_PORT" "$SERVICE"; then
         as_root tee "$SERVICE" >/dev/null <<EOF
 [Unit]
 Description=llama-swap AI Model Router
@@ -1722,7 +1746,7 @@ Environment="LLAMA_CACHE=$MODEL_DIR"
 
 ExecStart=$BIN_DIR/llama-swap \
     -config $CONFIG_DIR/config.yaml \
-    -listen 0.0.0.0:9999 \
+    -listen 0.0.0.0:$LLAMA_SWAP_PORT \
     -watch-config
 
 Restart=always
@@ -1793,6 +1817,16 @@ summary() {
     echo "Installed to: $PREFIX"
     echo "llama-swap data: $DATA_DIR"
     echo "     stack config: $STACK_CONF"
+    echo "     build mode: ${INSTALL_MODE:-source}"
+    echo
+    local svc_state host_ip
+    svc_state="$(systemctl is-active llama-swap.service 2>/dev/null || true)"
+    host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    echo "llama-swap service: ${svc_state:-unknown}"
+    echo "llama-swap API/UI:  http://localhost:$LLAMA_SWAP_PORT/ (port: $LLAMA_SWAP_PORT)"
+    [[ -n "$host_ip" ]] && echo "                    http://$host_ip:$LLAMA_SWAP_PORT/"
+    [[ -f "$BIN_DIR/kokoro-fastapi" ]] && \
+        echo "kokoro TTS:         http://127.0.0.1:8880/ (KOKORO_PORT to change)"
     echo
     echo "Versions:"
     for c in llama ik-llama sd whisper kokoro crispasr acestep audio; do
@@ -1817,6 +1851,10 @@ summary() {
     done
     [[ -f "$BIN_DIR/kokoro-fastapi" ]] && echo "  $BIN_DIR/kokoro-fastapi"
     [[ -f "$BIN_DIR/llama-swap" ]] && echo "  $BIN_DIR/llama-swap"
+    echo
+    echo "Manage the service with:"
+    echo "  systemctl status llama-swap"
+    echo "  journalctl -u llama-swap -f"
     echo
     echo "Add this to your ~/.bashrc if needed:"
     echo "export PATH=$BIN_DIR:\$PATH"

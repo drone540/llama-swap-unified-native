@@ -41,10 +41,12 @@ Clone this repository (or copy `install-ai-stack.sh`), then run:
 ./install-ai-stack.sh
 ```
 
-Run it **as a normal user** — not with `sudo`. The installer uses `sudo` only for
-the specific operations that genuinely need root (system packages, the
-`/opt/ai-stack` tree, the systemd service, swap files). All building, cloning,
-and package downloads happen under your account.
+Run it **as a normal user**. The installer uses `sudo` only for the specific
+operations that genuinely need root (system packages, the `/opt/ai-stack` tree,
+the systemd service, swap files). All building, cloning, and package downloads
+happen under your account. It also works when started as **root** (for example
+a Proxmox VE shell, where `sudo` may not be installed): privileged actions then
+run directly instead of via `sudo`.
 
 On the **first run** you first choose an install mode (build from source, or
 download prebuilt release binaries), then which components to install, then
@@ -80,6 +82,7 @@ re-asked. To change your choices:
 | `--component NAME` | Add a component to install; may be repeated |
 | `--kokoro-device D` | Kokoro device: `gpu`, `gpu-cu128`, `cpu`, `rocm` (default `auto`) |
 | `--cuda-archs AR` | CUDA architectures for CUDA builds (default native) |
+| `--port N` | TCP port for the llama-swap API/web UI (default `9999`) |
 | `--jobs N` | Number of parallel build jobs (default: auto by RAM, capped at nproc) |
 | `--swap-size SIZE` | Swap file size offered by the low-memory prompt (default `8G`) |
 | `--no-swap` | Never create or prompt about swap files |
