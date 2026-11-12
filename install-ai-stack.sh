@@ -808,9 +808,18 @@ ensure_cuda_toolkit() {
         selected="${selected//./-}"
     fi
 
-    local pkg="cuda-toolkit-$selected"
-    info "Installing $pkg (compatible with driver CUDA $driver_cuda_max)..."
-    as_root apt-get install -y --no-install-recommends "$pkg" || return 1
+    local pkgs=("cuda-toolkit-$selected")
+    # NCCL (in the same CUDA repo) is a multi-GPU collective library that some
+    # projects probe for. Only pull it in when 2+ NVIDIA GPUs are present.
+    local ngpu
+    ngpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d '[:space:]')"
+    [[ "$ngpu" =~ ^[0-9]+$ ]] || ngpu=0
+    if (( ngpu > 1 )); then
+        info "Detected $ngpu NVIDIA GPUs; including libnccl-dev for multi-GPU support."
+        pkgs+=(libnccl-dev)
+    fi
+    info "Installing ${pkgs[*]} (compatible with driver CUDA $driver_cuda_max)..."
+    as_root apt-get install -y --no-install-recommends "${pkgs[@]}" || return 1
 
     export PATH="/usr/local/cuda/bin:$PATH"
     export CUDA_HOME="/usr/local/cuda"
