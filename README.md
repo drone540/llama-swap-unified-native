@@ -92,6 +92,7 @@ re-asked. To change your choices:
 | `--reconfigure` | Re-ask components and backends even if a config exists |
 | `--uninstall` | Remove installed AI software |
 | `--purge-data` | Also delete the data directory (with `--uninstall`) |
+| `--purge-ccache` | Clear the ccache object cache (ccache stays installed; sources and build dirs are kept) |
 | `-h`, `--help` | Show full usage |
 
 ### Examples
@@ -137,8 +138,10 @@ can't be provisioned, that component falls back to CPU with a warning.
 - **Source repositories** → `~/.local/share/ai-stack/src/`
   (e.g. `llama.cpp/`, `whisper.cpp/`) — cloned automatically if missing;
   user-owned, so you can `git pull` or `git checkout` freely
-- **Build directories** → `~/.cache/ai-stack/build/<component>/` — kept
-  outside the source trees, user-owned
+- **Build directories** → `~/.cache/ai-stack/build/<component>/<backend>/` —
+  kept outside the source trees and user-owned. They are persistent and
+  separated per backend, so switching between CUDA/Vulkan does not overwrite
+  another backend's CMake configuration.
 - **Models / data / server config** → `/var/lib/llama-swap` (owned by the
   `llama-swap` system account that runs the service)
 - **Node.js 24** (for the web UI) → installed via nvm into your home, with
@@ -160,6 +163,32 @@ Add the bin dir to your shell if it isn't already on `PATH`:
 
 ```bash
 echo 'export PATH=/opt/ai-stack/bin:$PATH' >> ~/.bashrc
+```
+
+## Build caching (ccache)
+
+Source builds use [ccache](https://ccache.dev/) automatically. It is installed
+as a permanent package (it is **not** removed with the temporary build
+dependencies) and uses its default per-user cache directory.
+
+- CMake is configured with `ccache` as the C/C++ compiler launcher, plus the
+  CUDA launcher for CUDA builds. Build directories keep the setting, so rebuilds
+  and backend switches reuse compiled objects.
+- Statistics are reset once at the start of each run and shown in the final
+  summary, along with the cache directory and current size.
+- If `ccache` is unavailable, builds still work normally (just without caching).
+- `--purge-ccache` empties the cache (`ccache --clear`) without uninstalling
+  ccache or deleting source/build directories. Uninstalling the stack leaves the
+  cache in place.
+
+Useful commands:
+
+```bash
+ccache --show-stats     # hit/miss statistics
+ccache --show-size      # current cache size
+ccache --clear          # empty the cache
+# Optional cache size limit (uncomment in the installer to apply):
+# ccache --set-config=max_size=8G
 ```
 
 ## Notes

@@ -160,6 +160,8 @@ Options:
                     $STACK_CONF is reused as-is.
   --uninstall       Remove installed AI software.
   --purge-data      Also delete the data directory (with --uninstall).
+  --purge-ccache    Clear the ccache object cache (ccache stays installed;
+                    source checkouts and CMake build dirs are kept).
   -h, --help        Show this help and exit.
 
 Examples:
@@ -213,6 +215,8 @@ while [[ $# -gt 0 ]]; do
             UNINSTALL=1; shift ;;
         --purge-data)
             PURGE_DATA=1; shift ;;
+        --purge-ccache)
+            PURGE_CCACHE=1; shift ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -637,6 +641,20 @@ ensure_nodejs() {
     fi
 }
 
+# ccache is a permanent build dependency: it accelerates rebuilds and is kept
+# installed after the run (never added to TEMP_PACKAGES). Uses ccache's default
+# per-user cache directory; compression is on by default in ccache.
+ensure_ccache() {
+    command -v ccache >/dev/null 2>&1 && return 0
+    info "Installing ccache (persistent compiler cache)..."
+    if ! as_root apt-get update || ! as_root apt-get install -y ccache; then
+        warn "Could not install ccache; continuing without build caching."
+        return 0
+    fi
+    # Optional: uncomment to limit the maximum cache size.
+    # ccache --set-config=max_size=8G
+}
+
 ensure_build_dependencies() {
     TEMP_PACKAGES=()
     local missing=()
@@ -651,6 +669,8 @@ ensure_build_dependencies() {
         as_root apt-get install -y "${missing[@]}"
         TEMP_PACKAGES=("${missing[@]}")
     fi
+
+    ensure_ccache
 }
 
 cleanup_build_dependencies() {
@@ -1236,12 +1256,22 @@ build_and_install() {
 
     ensure_submodules "$src"
 
-    local build_dir="$BUILD_DIR/$c"
+    # Keep a persistent, per-backend CMake build directory: switching backends
+    # must not overwrite another backend's configuration, and ordinary rebuilds
+    # reuse the existing tree (CMake handles incremental changes itself). All
+    # backends share the same ccache.
+    local build_dir="$BUILD_DIR/$c/$backend"
     mkdir -p "$build_dir"
     local common_flags=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF)
 
-    # Avoid stale cmake cache from a previous backend run
-    rm -rf "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles" 2>/dev/null || true
+    # Reuse compiled objects through ccache. C/C++ launchers are always safe;
+    # the CUDA launcher is only added for CUDA builds. These -D flags are
+    # passed on every configure, so pre-existing build dirs pick them up too.
+    if command -v ccache >/dev/null 2>&1; then
+        common_flags+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+        [[ "$backend" == "cuda" ]] && common_flags+=(-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
+        note "ccache enabled for compiler launchers (backend: $backend)."
+    fi
 
     # Mutually exclude other backends to prevent cache contamination
     [[ "$backend" == "cuda" ]]   && common_flags+=("-DGGML_VULKAN=OFF")
@@ -1291,6 +1321,15 @@ build_and_install() {
 
     info "cmake configure..."
     cmake -S "$src" -B "$build_dir" "${common_flags[@]}" "${extra[@]}" $flags "${cuda_linker[@]}"
+
+    # Confirm ccache is actually wired into the generated build system.
+    if command -v ccache >/dev/null 2>&1; then
+        if grep -q 'CMAKE_CXX_COMPILER_LAUNCHER:.*ccache' "$build_dir/CMakeCache.txt" 2>/dev/null; then
+            note "ccache compiler launcher verified in CMake cache."
+        else
+            warn "$c: ccache launcher not found in CMake cache; building uncached."
+        fi
+    fi
 
     info "Building targets: $targets"
     cmake --build "$build_dir" --config Release -j"$BUILD_JOBS" --target $targets
@@ -1812,6 +1851,18 @@ EOF
 # Uninstall
 ################################################################################
 
+# Independent action: empty the ccache object cache. ccache itself stays
+# installed, and source checkouts / CMake build directories are left untouched.
+purge_ccache() {
+    if ! command -v ccache >/dev/null 2>&1; then
+        warn "ccache is not installed; nothing to purge."
+        return 0
+    fi
+    info "Clearing ccache contents (ccache --clear)..."
+    ccache --clear || { warn "ccache --clear failed."; return 1; }
+    ok "ccache cache cleared (ccache remains installed)."
+}
+
 uninstall() {
     require_sudo
     info "Removing installed software..."
@@ -1886,6 +1937,19 @@ summary() {
     done
     [[ -f "$BIN_DIR/kokoro-fastapi" ]] && echo "  $BIN_DIR/kokoro-fastapi"
     [[ -f "$BIN_DIR/llama-swap" ]] && echo "  $BIN_DIR/llama-swap"
+    if command -v ccache >/dev/null 2>&1; then
+        echo
+        echo "ccache:"
+        echo "  Cache directory: $(ccache --get-config cache_dir 2>/dev/null || echo unknown)"
+        echo "  Current size:    $(ccache --show-size 2>/dev/null || echo unknown)"
+        echo "  Statistics (this run):"
+        ccache --show-stats 2>/dev/null | sed 's/^/    /' || true
+        echo
+        echo "  Manual commands:"
+        echo "    ccache --show-stats    # view statistics"
+        echo "    ccache --show-size     # view cache size"
+        echo "    ccache --clear         # clear cache (or use --purge-ccache)"
+    fi
     echo
     echo "Manage the service with:"
     echo "  systemctl status llama-swap"
@@ -2432,6 +2496,14 @@ main() {
     # re-saves after the installs pick up any resolved KOKORO_DEVICE.
     save_config
 
+    # Reset ccache statistics exactly once per run so the final summary reflects
+    # this installation. This never clears cached objects. On a fresh install
+    # ccache may not be installed yet (ensure_build_dependencies installs it);
+    # its statistics then already start at zero.
+    if command -v ccache >/dev/null 2>&1; then
+        ccache --zero-stats >/dev/null 2>&1 || true
+    fi
+
     if [[ "$INSTALL_MODE" == "release" ]]; then
         ensure_runtime_dependencies
 
@@ -2515,6 +2587,11 @@ main() {
 
     summary
 }
+
+if [[ "${PURGE_CCACHE:-0}" == 1 ]]; then
+    purge_ccache
+    exit $?
+fi
 
 if [[ "${UNINSTALL:-0}" == 1 ]]; then
     uninstall
