@@ -1574,10 +1574,36 @@ build_llama_swap_from_source() {
     ensure_source_repo llama-swap "$(repo_url llama-swap)" || true
     local go_dir="$LLAMA_SWAP_DIR"
     [[ -d "$go_dir" ]] || die "llama-swap source not found: $go_dir"
-    info "Building llama-swap from source..."
-    ( cd "$go_dir" && CGO_ENABLED=0 go build -trimpath -o "$TMPDIR/llama-swap" . )
-    as_root install -m755 "$TMPDIR/llama-swap" "$BIN_DIR/llama-swap"
-    record_version llama-swap "$go_dir"
+
+    # Skip the (slow) rebuild when the checkout and installed binary already
+    # match the recorded source version. The "src-" prefix keeps source builds
+    # distinct from release versions (install_llama_swap), so switching modes
+    # is not mistaken for "already up to date". --reconfigure forces a rebuild.
+    local inst cur
+    inst="$(get_installed_version LLAMA_SWAP || true)"
+    cur="$(git -C "$go_dir" describe --tags --exact-match 2>/dev/null || true)"
+    [[ -z "$cur" ]] && cur="$(git -C "$go_dir" describe --tags 2>/dev/null || true)"
+    [[ -z "$cur" ]] && cur="$(git -C "$go_dir" rev-parse --short HEAD 2>/dev/null || true)"
+    if [[ "$RECONFIGURE" != 1 && -n "$cur" && "$inst" == "src-$cur" && -x "$BIN_DIR/llama-swap" ]]; then
+        ok "llama-swap already up to date at $cur (source build)"
+        install_llama_swap_service
+        return 0
+    fi
+
+    # The Makefile builds the embedded web UI (uses Node.js/npm, installed by
+    # ensure_nodejs) and the embedded source bundle, then produces
+    # build/llama-swap-<os>-<arch>.
+    local goos goarch built
+    goos="$(go env GOOS 2>/dev/null || echo linux)"
+    goarch="$(go env GOARCH 2>/dev/null || echo amd64)"
+    built="$go_dir/build/llama-swap-$goos-$goarch"
+
+    info "Building llama-swap from source (with web UI)..."
+    ( cd "$go_dir" && make clean && make ) || die "llama-swap build failed"
+    [[ -x "$built" ]] || die "llama-swap build produced no binary at $built"
+
+    as_root install -m755 "$built" "$BIN_DIR/llama-swap"
+    set_installed_version LLAMA_SWAP "src-$cur"
     install_llama_swap_service
     ok "Built llama-swap from source"
 }
@@ -2460,8 +2486,12 @@ main() {
             esac
         done
 
-        # llama-swap is always installed
-        if command -v go >/dev/null 2>&1 && [[ ! -f "$BIN_DIR/llama-swap" ]]; then
+        # llama-swap: build from source when Go is available (includes the web
+        # UI, built via `make`), otherwise fall back to the prebuilt release.
+        # This decision must not depend on whether a binary already exists,
+        # otherwise the first run would build from source and later runs would
+        # silently switch to the release.
+        if command -v go >/dev/null 2>&1; then
             build_llama_swap_from_source
         else
             install_llama_swap
